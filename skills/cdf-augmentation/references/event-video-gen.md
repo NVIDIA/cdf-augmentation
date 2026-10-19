@@ -69,10 +69,10 @@ Build the augmentation image from the repo root when a fresh local image is
 required:
 
 ```bash
-docker build -t paidf-augmentation:latest -f docker/Dockerfile .
+docker build -t cdf-augmentation:latest -f docker/Dockerfile .
 ```
 
-For a prebuilt image, replace `paidf-augmentation:latest` with the exact tag or
+For a prebuilt image, replace `cdf-augmentation:latest` with the exact tag or
 digest being validated. Mount the current branch's configs and modules
 read-only, and mount input and output directories separately:
 
@@ -80,12 +80,12 @@ read-only, and mount input and output directories separately:
 HOST_INPUT="/absolute/path/to/smart_spaces_inputs"
 HOST_OUTPUT="/absolute/path/to/smart_spaces_outputs"
 mkdir -p "$HOST_OUTPUT"
-docker network inspect paidf >/dev/null 2>&1 || \
-  docker network create paidf
+docker network inspect cdf >/dev/null 2>&1 || \
+  docker network create cdf
 
 docker run --rm -it \
   --user "$(id -u):$(id -g)" \
-  --network paidf \
+  --network cdf \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
   -e VLM_API_KEY \
@@ -99,21 +99,21 @@ docker run --rm -it \
   -v "$HOST_OUTPUT:/workspace/data/out" \
   -w /workspace \
   --entrypoint /bin/bash \
-  paidf-augmentation:latest
+  cdf-augmentation:latest
 ```
 
 Mount the subdirectories individually, as above. Never mount over `/workspace`
 itself (`-v "$(pwd):/workspace"`) — it hides the image's venv at `/workspace/.venv`.
 
 Augmentation is an outbound client, so publish no ports with `-p`/`--publish`.
-Keep the shared `paidf` bridge above for remote endpoints. When a model runs in
+Keep the shared `cdf` bridge above for remote endpoints. When a model runs in
 another container, attach it to the same bridge and use its container name in
 the endpoint URL. Run host-local models in a container on the same bridge, or
 use a remote endpoint.
 
 > **Security:** Host networking is prohibited because it exposes host loopback
 > services and internal interfaces to the container. Use only the isolated
-> `paidf` bridge.
+> `cdf` bridge.
 
 The commands below assume `/workspace` as the working directory inside the container.
 

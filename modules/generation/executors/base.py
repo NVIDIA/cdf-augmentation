@@ -41,6 +41,15 @@ _MIME_BY_EXT: Dict[str, str] = {
 # Input kinds that carry binary media (read into the payload's ``media`` map).
 _MEDIA_KINDS = frozenset({"image", "video", "control"})
 
+# Roles whose endpoints must return media. A text-only reply from one of these
+# is the server explaining why it produced nothing -- e.g. vllm-omni answers an
+# empty diffusion output with HTTP 200 and "Image generation completed but no
+# images were produced." -- so writing it would leave a text file at the
+# .png/.mp4 output path and report success.
+MEDIA_OUTPUT_ROLES = frozenset(
+    {"image_edit", "image2video", "video_transfer", "video_predict"}
+)
+
 
 def _is_present(value: Any) -> bool:
     """True if ``value`` is a real input (not missing / None / a null-ish string)."""
@@ -184,10 +193,16 @@ class BaseExecutor(BaseGenerator):
 
     def _write(self, result, output_path: str) -> None:
         """Write the adapter result (media bytes XOR text) to ``output_path``."""
-        if result.media_bytes is not None:
+        if result.media_bytes:
             with msc.open(output_path, "wb") as f:
                 f.write(result.media_bytes)
         elif result.text is not None:
+            role = getattr(getattr(self.adapter, "endpoint", None), "role", None)
+            if role in MEDIA_OUTPUT_ROLES:
+                raise ValueError(
+                    f"{role} endpoint returned text instead of media "
+                    f"(request_id={result.request_id}): {result.text!r}"
+                )
             with msc.open(output_path, "w") as f:
                 f.write(result.text)
         else:

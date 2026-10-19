@@ -91,5 +91,5 @@ upstream sources are preserved inside the image under /usr/share/oss-sources/.
   ------------------   ----------   -----------------
   ffmpeg               9.0.1        LGPL-2.1-or-later    (--disable-gpl --disable-nonfree)
   nv-codec-headers     n12.1.14.0   MIT
-  python (CPython)     3.13.15      PSF-2.0
-  uv                   0.12.5       Apache-2.0 OR MIT
+  python (CPython)     3.13.16      PSF-2.0
+  uv                   0.12.24      Apache-2.0 OR MIT

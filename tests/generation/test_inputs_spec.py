@@ -25,12 +25,14 @@ def test_video_transfer():
         "depth": False,
         "seg": False,
         "vis": False,
+        "wsm": False,
     }
     assert spec["rgb"]["kind"] == "video"
     # Control modalities are tagged "control" so adapters can distinguish them
     # from the primary input (serialize in NIM, reject in single-input contracts).
     assert spec["edge"]["kind"] == "control"
     assert spec["depth"]["kind"] == "control"
+    assert spec["wsm"]["kind"] == "control"
 
 
 def test_video_predict_default_rgb_required():

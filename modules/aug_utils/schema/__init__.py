@@ -35,6 +35,8 @@ from .data_processing import AlignmentParameters, DataProcessingConfig
 from .preprocessing import PreprocessingConfig, ResizeConfig
 from .evaluators import (
     AttributeVerificationEvaluator,
+    CosmosEvaluator,
+    CosmosEvaluatorCheck,
     EvaluatorEntry,
     ExtraQuestion,
     HallucinationCheckEvaluator,
@@ -76,6 +78,8 @@ __all__ = [
     "PreprocessingConfig",
     "ResizeConfig",
     "AttributeVerificationEvaluator",
+    "CosmosEvaluator",
+    "CosmosEvaluatorCheck",
     "EvaluatorEntry",
     "ExtraQuestion",
     "HallucinationCheckEvaluator",

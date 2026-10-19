@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: video-data-augmentation-services
+
+# Shared VLM/LLM and Cosmos Evaluator services for the VDA test cases.
+# Every service uses container DNS on the external cdf Docker network.
+
+x-api-healthcheck: &api-healthcheck
+  test:
+    - CMD-SHELL
+    - >-
+      timeout 2 bash -c
+      'exec 3<>/dev/tcp/127.0.0.1/$${UVICORN_PORT:-8000}'
+  interval: 2s
+  timeout: 2s
+  retries: 150
+  start_period: 5s
+
+x-postgres: &postgres
+  image: nvcr.io/nvidia/cosmos/database-postgres:1.1.0
+  environment:
+    POSTGRES_USER: cosmos_eval
+    POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}"
+    POSTGRES_DB: cosmos_evaluator
+  healthcheck:
+    test: [CMD-SHELL, "pg_isready -U cosmos_eval -d cosmos_evaluator"]
+    interval: 2s
+    timeout: 2s
+    retries: 60
+
+# max-num-seqs 16: vLLM's default (1024) can exceed available Mamba cache
+# blocks on GPUs with less headroom
+x-vlm: &vlm
+  image: nvcr.io/nvidia/vllm:26.05.post1-py3
+  ipc: host
+  environment:
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+  command:
+    - vllm
+    - serve
+    - Qwen/Qwen3.8-27B-FP8
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8000"
+    - --trust-remote-code
+    - --max-model-len
+    - "32768"
+    - --dtype
+    - auto
+    - --max-num-seqs
+    - "16"
+    - --gpu-memory-utilization
+    - "0.9"
+    - --default-chat-template-kwargs
+    - '{"enable_thinking": false}'
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+  ports:
+    - "8000:8000"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8000/health')
+    interval: 10s
+    timeout: 3s
+    retries: 180
+    start_period: 30s
+
+x-storage-environment: &storage-environment
+  MSC_CONFIG: /run/secrets/cosmos-msc.json
+  S8K_ACCESS_KEY: "${S8K_ACCESS_KEY:?Set S8K_ACCESS_KEY}"
+  S8K_SECRET_KEY: "${S8K_SECRET_KEY:?Set S8K_SECRET_KEY}"
+
+x-storage-volumes: &storage-volumes
+  - "${COSMOS_DEPLOY_DIR:?Set COSMOS_DEPLOY_DIR}/msc.json:/run/secrets/cosmos-msc.json:ro"
+
+services:
+  vlm:
+    <<: *vlm
+    networks: [cdf]
+
+  cosmos-evaluator-postgres:
+    <<: *postgres
+    networks: [cdf]
+
+  cosmos-evaluator-database:
+    image: nvcr.io/nvidia/cosmos/database:1.1.0
+    depends_on:
+      cosmos-evaluator-postgres:
+        condition: service_healthy
+    environment:
+      COSMOS_EVALUATOR_ENV: production
+      DATABASE_DB_CONFIG: >-
+        {"host":"cosmos-evaluator-postgres","port":5432,"database":"cosmos_evaluator","user":"cosmos_eval","password":"${POSTGRES_PASSWORD}"}
+      DATABASE_READ_KEY: "${DATABASE_READ_KEY:-}"
+      DATABASE_ADMIN_KEY: "${DATABASE_ADMIN_KEY:-}"
+    ports:
+      - "127.0.0.1:8087:8000"
+    networks: [cdf]
+    healthcheck: *api-healthcheck
+
+  cosmos-evaluator-hallucination:
+    image: nvcr.io/nvidia/cosmos/hallucination-checker:1.1.0
+    environment:
+      <<: *storage-environment
+      COSMOS_EVALUATOR_ENV: production
+      HALLUCINATION_PROCESS_CONCURRENCY_LIMIT: "1"
+    volumes: *storage-volumes
+    ports:
+      - "127.0.0.1:8085:8000"
+    networks: [cdf]
+    healthcheck: *api-healthcheck
+
+  cosmos-evaluator-attribute-verification:
+    image: nvcr.io/nvidia/cosmos/attribute-verification-checker:1.1.0
+    environment:
+      <<: *storage-environment
+      COSMOS_EVALUATOR_ENV: production
+    volumes: *storage-volumes
+    ports:
+      - "127.0.0.1:8086:8000"
+    networks: [cdf]
+    healthcheck: *api-healthcheck
+
+  cosmos-evaluator-arbitrator:
+    image: nvcr.io/nvidia/cosmos/arbitrator:1.1.0
+    depends_on:
+      cosmos-evaluator-database:
+        condition: service_healthy
+      cosmos-evaluator-hallucination:
+        condition: service_healthy
+      cosmos-evaluator-attribute-verification:
+        condition: service_healthy
+    environment:
+      COSMOS_EVALUATOR_ENV: production
+      COSMOS_EVALUATOR_DATABASE_API_URL: http://cosmos-evaluator-database:8000
+      ARBITRATOR_DATABASE_API_KEY: "${DATABASE_ADMIN_KEY:-}"
+      COSMOS_EVALUATOR_CHECKER_ENDPOINTS: >-
+        {"metropolis.hallucination":"http://cosmos-evaluator-hallucination:8000","metropolis.attribute_verification":"http://cosmos-evaluator-attribute-verification:8000"}
+    ports:
+      - "127.0.0.1:8080:8000"
+    networks: [cdf]
+    healthcheck: *api-healthcheck
+
+networks:
+  cdf:
+    name: cdf
+    external: true

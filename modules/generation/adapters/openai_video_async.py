@@ -14,7 +14,9 @@ rendered bytes from a separate content route::
 
     POST {url}                         (multipart/form-data)
       file: input_reference=<first frame image>   # optional (text->video too)
+      file: control_reference=<WSM video>         # optional (Cosmos3 transfer)
       form: model, prompt, seconds, size, ...      # knobs forwarded verbatim
+      form: control_type=wsm                       # with control_reference
       -> {"id": "video_...", "status": "processing", ...}
 
     GET  {url}/{id}                    -> {"status": "completed" | "failed" | ...}
@@ -39,11 +41,14 @@ import requests
 from .base import (
     BaseAdapter,
     Result,
-    first_media,
+    control_media,
+    primary_media,
     reject_control_media,
     strip_url_credentials,
 )
 from .openai_video_sync import (
+    DEFAULT_CONTROL_FILE_FIELD,
+    DEFAULT_CONTROL_TYPE_FIELD,
     VIDEO_DEFAULT_TIMEOUT,
     _basename,
     _decode_response,
@@ -93,7 +98,6 @@ class OpenAIVideoAsyncAdapter(BaseAdapter):
         )
 
     def invoke(self, payload: Dict[str, Any]) -> Result:
-        reject_control_media(payload, "OpenAIVideoAsyncAdapter")
         # One budget spans the whole create -> poll -> download flow so the
         # advertised endpoint timeout actually bounds it (not just the poll loop).
         deadline = time.monotonic() + self.timeout
@@ -105,6 +109,15 @@ class OpenAIVideoAsyncAdapter(BaseAdapter):
 
     def _create(self, payload: Dict[str, Any], deadline: float) -> str:
         """POST the multipart create request; return the job id."""
+        controls = control_media(payload)
+        if controls and not (
+            self.role == "video_transfer"
+            and len(controls) == 1
+            and controls[0][0] == "wsm"
+        ):
+            reject_control_media(payload, "OpenAIVideoAsyncAdapter")
+        wsm = controls[0][1] if controls else None
+
         data: Dict[str, str] = {}
         prompt = payload.get("prompt")
         if prompt:
@@ -118,14 +131,21 @@ class OpenAIVideoAsyncAdapter(BaseAdapter):
         if self.model:
             data.setdefault("model", self.model)
 
-        media = first_media(payload)
+        files = {}
+        media = primary_media(payload)
         if media is not None:
             filename = _basename(media.get("path")) or "input.png"
             mime = media.get("mime", "image/png")
-            post_kwargs = {
-                "data": data,
-                "files": {self.file_field: (filename, media["bytes"], mime)},
-            }
+            files[self.file_field] = (filename, media["bytes"], mime)
+
+        if wsm is not None:
+            filename = _basename(wsm.get("path")) or "wsm.mp4"
+            mime = wsm.get("mime", "video/mp4")
+            files[DEFAULT_CONTROL_FILE_FIELD] = (filename, wsm["bytes"], mime)
+            data[DEFAULT_CONTROL_TYPE_FIELD] = "wsm"
+
+        if files:
+            post_kwargs = {"data": data, "files": files}
         else:
             # Text-to-video: no file part. Send the form fields as multipart parts
             # anyway (``data=`` alone is application/x-www-form-urlencoded, which
@@ -168,22 +188,34 @@ class OpenAIVideoAsyncAdapter(BaseAdapter):
                     f"video job {job_id} did not complete within {self.timeout:.0f}s "
                     f"(last status={last_status!r})"
                 )
-            resp = requests.get(
-                poll_url, headers=headers, timeout=self._remaining_timeout(deadline)
-            )
-            self._raise_for_status(resp, "poll", poll_url)
-            job = self._json(resp, "poll")
-            status = (job.get("status") or "").lower()
-            if status != last_status:
-                self.logger.info("Video job %s status=%s", job_id, status or "?")
-                last_status = status
-            if status in _SUCCESS_STATES:
-                return
-            if status in _FAILURE_STATES or job.get("error"):
-                raise RuntimeError(
-                    f"video job {job_id} failed (status={status!r}): "
-                    f"{str(job.get('error'))[:1000]}"
+            try:
+                resp = requests.get(
+                    poll_url, headers=headers, timeout=self._remaining_timeout(deadline)
                 )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                # Status GET is safe to repeat. Keep polling the submitted job;
+                # restarting invoke() would POST a second expensive video job.
+                self.logger.warning(
+                    "Video job %s status poll %s: %s; %.0fs remain before deadline",
+                    job_id,
+                    type(exc).__name__,
+                    exc,
+                    max(0.0, deadline - time.monotonic()),
+                )
+            else:
+                self._raise_for_status(resp, "poll", poll_url)
+                job = self._json(resp, "poll")
+                status = (job.get("status") or "").lower()
+                if status != last_status:
+                    self.logger.info("Video job %s status=%s", job_id, status or "?")
+                    last_status = status
+                if status in _SUCCESS_STATES:
+                    return
+                if status in _FAILURE_STATES or job.get("error"):
+                    raise RuntimeError(
+                        f"video job {job_id} failed (status={status!r}): "
+                        f"{str(job.get('error'))[:1000]}"
+                    )
             # Don't let the fixed poll interval overshoot the remaining budget.
             time.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
 

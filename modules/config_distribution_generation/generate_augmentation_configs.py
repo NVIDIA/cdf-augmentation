@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from modules.aug_utils.common import is_remote_path
 from modules.aug_utils.nvcf import load_secrets
 from modules.aug_utils.constants import MEDIA_EXTENSIONS, is_image, is_video
+from modules.aug_utils.stream_keys import resolve_stream_key
 
 
 _MSC_REVERSE_PATH_MAPPINGS: Optional[List[tuple[str, str]]] = None
@@ -823,6 +824,185 @@ def _slugify_name(value: str) -> str:
     return slug or "item"
 
 
+_EXTERNAL_CHECKER_URI_SCHEMES = frozenset({"s3", "gs", "az", "http", "https"})
+_INPUT_RGB_REFERENCE = "${data.0.inputs.rgb}"
+_SYNCHRONIZED_COSMOS_CHECKS = frozenset(
+    {"metropolis.hallucination", "metropolis.attribute_verification"}
+)
+
+
+def _is_external_checker_uri(value: Any) -> bool:
+    """Return whether a URI is directly readable by external checker services."""
+    if not isinstance(value, str):
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme.lower() in _EXTERNAL_CHECKER_URI_SCHEMES and bool(
+        parsed.netloc
+    )
+
+
+def _relative_output_prefix(output_video: str) -> str:
+    """Derive the checker artifact prefix from a generated remote output path."""
+    parsed = urlparse(output_video)
+    prefix = posixpath.dirname(parsed.path).strip("/")
+    if not prefix:
+        raise ValueError(
+            "external Cosmos evaluation requires generated output.video to have "
+            "a non-empty object-storage directory"
+        )
+    return prefix
+
+
+def _synchronize_cosmos_evaluator_batch_config(
+    config: Dict[str, Any],
+    data_entry: Dict[str, Any],
+    sampled_variables: Dict[str, str],
+) -> None:
+    """Synchronize generated media paths and selections for external Cosmos checks."""
+    evaluators = config.get("evaluators") or []
+    if not isinstance(evaluators, list):
+        return
+
+    for entry in evaluators:
+        if not isinstance(entry, dict):
+            continue
+        cosmos = entry.get("cosmos_evaluator")
+        if not isinstance(cosmos, dict) or not cosmos.get("enabled", True):
+            continue
+
+        checks = cosmos.get("checks") or []
+        check_names = {
+            check.get("name")
+            for check in checks
+            if isinstance(check, dict) and isinstance(check.get("name"), str)
+        }
+        relevant_checks = check_names & _SYNCHRONIZED_COSMOS_CHECKS
+        if not relevant_checks:
+            continue
+
+        output = data_entry.get("output")
+        if not isinstance(output, dict):
+            raise ValueError(
+                "external Cosmos evaluation requires data[0].output to be a mapping"
+            )
+        output_video = output.get("video")
+        if not _is_external_checker_uri(output_video):
+            raise ValueError(
+                "external Cosmos evaluation requires generated output.video to use "
+                "s3://, gs://, az://, http://, or https:// storage"
+            )
+
+        if "evaluation" in output:
+            output["evaluation"] = _join_path(
+                _path_parent(output_video), "evaluation.json"
+            )
+            if not _is_external_checker_uri(output["evaluation"]):
+                raise ValueError(
+                    "external Cosmos evaluation requires data[0].output.evaluation "
+                    "to use externally readable remote storage"
+                )
+
+        output_prefix = _relative_output_prefix(output_video)
+        output["prefix"] = output_prefix
+        cosmos["output_storage_prefix"] = (
+            f"{output_prefix.rstrip('/')}/cosmos-evaluator/"
+        )
+
+        if "metropolis.hallucination" in relevant_checks:
+            inputs = data_entry.get("inputs")
+            input_uri = inputs.get("rgb") if isinstance(inputs, dict) else None
+            if not _is_external_checker_uri(input_uri):
+                raise ValueError(
+                    "metropolis.hallucination requires data[0].inputs.rgb to use "
+                    "s3://, gs://, az://, http://, or https:// storage"
+                )
+
+            stream_key = cosmos.get("stream_key")
+            if stream_key is None:
+                stream_key = resolve_stream_key(output_video)
+            elif not isinstance(stream_key, str) or not stream_key.strip():
+                raise ValueError(
+                    "metropolis.hallucination requires a nonempty "
+                    "cosmos_evaluator.stream_key when configured"
+                )
+            cosmos_inputs = cosmos.get("inputs")
+            original_urls = (
+                cosmos_inputs.get("original_video_urls")
+                if isinstance(cosmos_inputs, dict)
+                else None
+            )
+            if not isinstance(original_urls, dict):
+                raise ValueError(
+                    "metropolis.hallucination requires an existing "
+                    "cosmos_evaluator.inputs.original_video_urls mapping"
+                )
+            if stream_key in original_urls:
+                original_url = original_urls[stream_key]
+            elif cosmos.get("stream_key") is None and len(original_urls) == 1:
+                original_url = next(iter(original_urls.values()))
+                original_urls.clear()
+                original_urls[stream_key] = original_url
+            else:
+                raise ValueError(
+                    "metropolis.hallucination requires an existing "
+                    "cosmos_evaluator.inputs.original_video_urls entry for "
+                    f"stream_key {stream_key!r}"
+                )
+            if original_url != _INPUT_RGB_REFERENCE and not _is_external_checker_uri(
+                original_url
+            ):
+                raise ValueError(
+                    "metropolis.hallucination requires the template's existing "
+                    "cosmos_evaluator.inputs.original_video_urls entry for "
+                    f"stream_key {stream_key!r} to reference data[0].inputs.rgb "
+                    "or use s3://, gs://, az://, http://, or https:// storage"
+                )
+            original_urls[stream_key] = input_uri
+
+        if "metropolis.attribute_verification" in relevant_checks:
+            checker_config = cosmos.get("config")
+            selected_variables = (
+                checker_config.get("selected_variables")
+                if isinstance(checker_config, dict)
+                else None
+            )
+            variable_options = (
+                checker_config.get("variable_options")
+                if isinstance(checker_config, dict)
+                else None
+            )
+            if not isinstance(selected_variables, dict):
+                raise ValueError(
+                    "metropolis.attribute_verification requires a "
+                    "config.selected_variables mapping"
+                )
+            if variable_options is not None and not isinstance(variable_options, dict):
+                raise ValueError(
+                    "metropolis.attribute_verification config.variable_options "
+                    "must be a mapping when configured"
+                )
+
+            for name in list(selected_variables):
+                if name not in sampled_variables:
+                    continue
+                selected_value = sampled_variables[name]
+                if variable_options is not None:
+                    options = variable_options.get(name)
+                    if not isinstance(options, list):
+                        raise ValueError(
+                            "metropolis.attribute_verification requires "
+                            f"config.variable_options.{name} to be a list"
+                        )
+                    occurrences = options.count(selected_value)
+                    if occurrences != 1:
+                        raise ValueError(
+                            f"sampled {name} value {selected_value!r} must appear exactly "
+                            "once in cosmos_evaluator.config.variable_options."
+                            f"{name}; found {occurrences}"
+                        )
+                selected_variables[name] = selected_value
+
+
 def _set_dotted_path(config: Dict[str, Any], dotted_path: str, value: Any) -> None:
     """Set a nested dictionary/list value using a simple dot path."""
     current: Any = config
@@ -927,6 +1107,12 @@ def create_augmentation_config(
             and "shoe_color" in base_to_write
         ):
             base_to_write["shoe_color"] = "none"
+
+    _synchronize_cosmos_evaluator_batch_config(
+        config,
+        data_entry,
+        vars_to_write,
+    )
 
     # Update captioning variables for direct LLM prompt generation
     if "captioning" in config:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+from copy import deepcopy
 import os
 import sys
 import logging
@@ -19,6 +20,11 @@ from verification.llm_question_generator import LLMQuestionGenerator
 from verification.vlm_verifier import VLMVerifier
 from verification.core import AttributeVerifier
 from verification.hallucination_checker import HallucinationChecker
+from verification.cosmos_evaluator import (
+    CosmosEvaluatorClient,
+    CosmosEvaluatorError,
+    CosmosEvaluationOutcome,
+)
 from aug_utils.common import (
     redact_overrides,
     validate_config_structure,
@@ -201,6 +207,28 @@ def _init_evaluators(config, logger):
     return hallucination_checker, attribute_verifier, av_config_obj, vlm_verifier
 
 
+def _init_cosmos_evaluator(pipeline_config, logger):
+    """Initialize the single enabled external Cosmos evaluator, if configured.
+
+    This stays separate from :func:`_init_evaluators` so the built-in
+    initializer retains its established four-value interface. Disabled entries
+    are ignored without constructing a client or performing network I/O.
+    """
+    for entry in pipeline_config.evaluators or []:
+        evaluator_config = entry.cosmos_evaluator
+        if evaluator_config is None or not evaluator_config.enabled:
+            continue
+        logger.info("Initializing external Cosmos evaluator...")
+        client = CosmosEvaluatorClient.from_config(
+            pipeline_config.endpoints,
+            evaluator_config,
+            logger=logger,
+        )
+        logger.info("External Cosmos evaluator initialized successfully")
+        return client
+    return None
+
+
 def _write_prompt_file(prompt_path: str, prompt: str, logger: logging.Logger) -> bool:
     """Persist the current prompt so retries keep metadata in sync."""
     try:
@@ -275,10 +303,10 @@ def _captioning_selections(config: dict, sample: dict | None = None) -> dict:
     return _first_values(values)
 
 
-def _attribute_verification_inputs(
+def _candidate_evaluation_inputs(
     config: dict, sample: dict | None = None
 ) -> tuple[dict, dict]:
-    """Resolve selected values and option pools for the existing checker."""
+    """Resolve candidate-specific values and option pools for any evaluator."""
     captioning_cfg = config.get("captioning") or {}
     template_cfg = captioning_cfg.get("template")
     if template_cfg is not None:
@@ -303,6 +331,34 @@ def _attribute_verification_inputs(
         verification_options if verification_options is not None else variables
     )
     return selected_variables, variable_options
+
+
+def _attribute_verification_inputs(
+    config: dict, sample: dict | None = None
+) -> tuple[dict, dict]:
+    """Backward-compatible wrapper for the built-in attribute verifier."""
+    return _candidate_evaluation_inputs(config, sample)
+
+
+def _cosmos_outcome_views(
+    outcome: CosmosEvaluationOutcome,
+    *,
+    attempt: int,
+    seed: int,
+) -> tuple[dict, dict]:
+    """Return persistable provider and compatibility views for one attempt."""
+    provider = deepcopy(outcome.provider_metadata)
+    provider.update(
+        {
+            "operational_success": outcome.operational_success,
+            "quality_passed": outcome.quality_passed,
+            "attempt": attempt,
+            "seed_used": seed,
+        }
+    )
+    if outcome.error and "error" not in provider:
+        provider["error"] = outcome.error
+    return provider, deepcopy(outcome.compatibility_aliases)
 
 
 def _common_message_prefix(message_lists: list) -> list:
@@ -583,6 +639,11 @@ def _prompt_builder_provenance(captioner) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="validate the resolved config and exit without endpoint calls or inference",
+    )
     args, unknown_args = parser.parse_known_args()
 
     # Initialize logger
@@ -595,7 +656,7 @@ def main():
 
     print()
     logger.info("=" * 80)
-    logger.info("PAIDF Augmentation")
+    logger.info("Cosmos Data Factory (CDF) Augmentation")
     logger.info(f"Start Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
 
@@ -627,6 +688,28 @@ def main():
     if pipeline_config is None:
         logger.error(
             "Configuration validation failed. Please fix the configuration file."
+        )
+        sys.exit(1)
+
+    if args.validate_only:
+        logger.info("Configuration validation passed; no endpoint calls were made")
+        return
+
+    # External evaluation is preflighted before any captioning or generation so
+    # a service/discovery problem cannot waste a generated candidate.
+    try:
+        cosmos_evaluator = _init_cosmos_evaluator(pipeline_config, logger)
+        if cosmos_evaluator is not None:
+            logger.info("Preflighting external Cosmos evaluator...")
+            cosmos_evaluator.preflight()
+            logger.info("External Cosmos evaluator preflight passed")
+    except CosmosEvaluatorError as exc:
+        logger.error("External Cosmos evaluator preflight failed: %s", exc)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error(
+            "External Cosmos evaluator preflight failed (%s)",
+            type(exc).__name__,
         )
         sys.exit(1)
 
@@ -722,6 +805,10 @@ def main():
             control_inputs = {}
             natural_caption_from_vlm = None
             gen_elapsed = None
+            cosmos_evaluator_results = None
+            cosmos_compatibility_aliases = {}
+            cosmos_operational_success = True
+            cosmos_quality_passed = True
 
             # ---- Captioning ----
             caption_exists = msc.is_file(sample["output"]["caption"])
@@ -886,6 +973,13 @@ def main():
                     models_fetched = True
                     generation_succeeded = True
                     sample["output"]["video"] = output_path
+                    # Cosmos results are scoped to the retained candidate. A
+                    # successful retry replaces that candidate, so its external
+                    # evaluation state must start clean.
+                    cosmos_evaluator_results = None
+                    cosmos_compatibility_aliases = {}
+                    cosmos_operational_success = True
+                    cosmos_quality_passed = True
                     logger.info(
                         f"Generation done in {gen_elapsed / 60:.2f} min, "
                         f"saved to: {output_path}"
@@ -1026,17 +1120,18 @@ def main():
                                             "Generated natural caption from VLM."
                                         )
                                 logger.info("All attribute checks passed.")
-                                break
                             else:
                                 logger.warning("Some attribute checks failed.")
                                 if attempt < max_retries:
                                     logger.info(
                                         f"Retrying (attempt {attempt + 2}/{max_attempts})"
                                     )
+                                    continue
                                 else:
                                     logger.warning(
                                         "Exhausted retries for attribute verification"
                                     )
+                                    break
                         except Exception as e:
                             logger.error(f"Attribute verification error: {e}")
                             verification_results = {
@@ -1046,11 +1141,99 @@ def main():
                                 "seed_used": current_seed,
                             }
                             break
-                    else:
-                        if not passed_hallucination_check and attempt < max_retries:
+                    elif not passed_hallucination_check:
+                        if attempt < max_retries:
                             continue
-                        else:
+                        break
+
+                    # ---- External Cosmos evaluation ----
+                    # Reaching this point means every enabled built-in gate has
+                    # passed for this candidate. The client owns Arbitrator
+                    # inputs and transport; the CLI supplies only the generated
+                    # URI plus an optional checker-neutral captioning overlay.
+                    if cosmos_evaluator is not None:
+                        print()
+                        logger.info("Running external Cosmos evaluation...")
+                        selected_variables = None
+                        variable_options = None
+                        if cosmos_evaluator.merge_captioning_selections:
+                            selected_variables, variable_options = (
+                                _candidate_evaluation_inputs(config, sample)
+                            )
+                        try:
+                            cosmos_outcome = cosmos_evaluator.evaluate_candidate(
+                                sample["output"]["video"],
+                                selected_variables=selected_variables,
+                                variable_options=variable_options,
+                            )
+                            (
+                                cosmos_evaluator_results,
+                                cosmos_compatibility_aliases,
+                            ) = _cosmos_outcome_views(
+                                cosmos_outcome,
+                                attempt=attempt + 1,
+                                seed=current_seed,
+                            )
+                        except Exception as exc:
+                            # The client normally converts expected failures to
+                            # typed outcomes. Treat an unexpected exception as a
+                            # service failure without persisting its potentially
+                            # sensitive message.
+                            cosmos_operational_success = False
+                            cosmos_quality_passed = False
+                            cosmos_evaluator_results = {
+                                "status": "service_failure",
+                                "operational_success": False,
+                                "quality_passed": None,
+                                "attempt": attempt + 1,
+                                "seed_used": current_seed,
+                                "error": f"unexpected {type(exc).__name__}",
+                            }
+                            cosmos_compatibility_aliases = {}
+                            logger.error(
+                                "External Cosmos evaluator failed unexpectedly (%s)",
+                                type(exc).__name__,
+                            )
                             break
+
+                        cosmos_operational_success = cosmos_outcome.operational_success
+                        failed_cosmos_checkers = ", ".join(
+                            cosmos_outcome.failed_checkers
+                        )
+                        failed_checker_suffix = (
+                            f"; failed checker(s): {failed_cosmos_checkers}"
+                            if failed_cosmos_checkers
+                            else ""
+                        )
+                        if not cosmos_operational_success:
+                            cosmos_quality_passed = False
+                            logger.error(
+                                "External Cosmos evaluator service/contract failure; "
+                                "stopping candidate retries%s",
+                                failed_checker_suffix,
+                            )
+                            break
+
+                        cosmos_quality_passed = cosmos_outcome.quality_passed is True
+                        if not cosmos_quality_passed:
+                            logger.warning(
+                                "External Cosmos quality gate rejected the candidate%s",
+                                failed_checker_suffix,
+                            )
+                            if attempt < max_retries:
+                                logger.info(
+                                    f"Retrying (attempt {attempt + 2}/{max_attempts})"
+                                )
+                                continue
+                            logger.warning(
+                                "Exhausted retries for external Cosmos evaluation"
+                            )
+                            break
+                        logger.info("External Cosmos evaluation passed")
+
+                    # All enabled built-in and external gates passed, or no
+                    # external evaluator is configured.
+                    break
 
                 # Restore seed
                 if original_seed is not None:
@@ -1088,6 +1271,12 @@ def main():
                 if verification_enabled and evaluation_passed:
                     evaluation_passed = bool(
                         verification_results and verification_results.get("passed")
+                    )
+                if cosmos_evaluator is not None:
+                    evaluation_passed = (
+                        evaluation_passed
+                        and cosmos_operational_success
+                        and cosmos_quality_passed
                     )
             sample_failed = eval_settings.strict and not evaluation_passed
             if sample_failed and not eval_settings.retain_failures:
@@ -1204,6 +1393,9 @@ def main():
                     metadata["hallucination_check"] = hallucination_results
                 if verification_results is not None:
                     metadata["attribute_verification"] = verification_results
+                if cosmos_evaluator_results is not None:
+                    metadata["cosmos_evaluator"] = cosmos_evaluator_results
+                    metadata.update(cosmos_compatibility_aliases)
                 if natural_caption_from_vlm:
                     metadata["natural_caption"] = natural_caption_from_vlm
                 if alignment_params:
@@ -1220,6 +1412,7 @@ def main():
                 if eval_path and (
                     hallucination_results is not None
                     or verification_results is not None
+                    or cosmos_evaluator_results is not None
                 ):
                     try:
                         eval_output = {}
@@ -1227,6 +1420,9 @@ def main():
                             eval_output["hallucination_check"] = hallucination_results
                         if verification_results is not None:
                             eval_output["attribute_verification"] = verification_results
+                        if cosmos_evaluator_results is not None:
+                            eval_output["cosmos_evaluator"] = cosmos_evaluator_results
+                            eval_output.update(cosmos_compatibility_aliases)
                         with msc.open(eval_path, "w") as f:
                             json.dump(eval_output, f, indent=2)
                         logger.info(f"Evaluation results written to {eval_path}")
