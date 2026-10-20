@@ -3,16 +3,16 @@
 
 # Convenience wrapper around the CLI. Endpoint URLs and model names come from
 # the config's `endpoints:` list, so nothing about the backend is set here.
-# Service names keep the paidf- prefix to match the image.
+# Service names keep the cdf- prefix to match the image.
 #
-#   docker compose -f examples/docker-compose.yml run --rm paidf-augmentation-gpu \
-#     --config configs/cookbook/video-data-augmentation/config_video_transfer_CT25_nim.yaml
+#   docker compose -f examples/docker-compose.yml run --rm cdf-augmentation-gpu \
+#     --config configs/cookbook/video-data-augmentation/config_video_transfer_CT3_omni.yaml
 #
 # Extra CLI arguments (OmegaConf overrides) can be appended to that command.
 
 services:
-  paidf-augmentation:
-    image: paidf-augmentation:1.1.0
+  cdf-augmentation:
+    image: nvcr.io/nvidia/cdf-augmentation:1.2.0
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -38,14 +38,14 @@ services:
       # first, or Docker will create a directory in its place.
       # - ./secrets.json:/var/secrets/secrets.json:ro
 
-  # Use this service for the CT2.5 example above, evaluators or
+  # Use this service for the CT3 example above, evaluators or
   # data_processing.transcode over H.264 input (hardware h264_cuvid decode
   # only; no software AVC fallback), or the cupy-based
   # data_processing.alignment post-processor. Pick a GPU that is not already
   # saturated by a co-located model server.
-  paidf-augmentation-gpu:
+  cdf-augmentation-gpu:
     extends:
-      service: paidf-augmentation
+      service: cdf-augmentation
     deploy:
       resources:
         reservations:

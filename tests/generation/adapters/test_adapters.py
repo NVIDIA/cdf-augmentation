@@ -557,9 +557,7 @@ class TestOpenAIVideoSyncAdapter:
             ) as get,
             patch("generation.adapters.openai_video_sync.time.sleep") as sleep,
         ):
-            result = OpenAIVideoSyncAdapter(ep, LOGGER).invoke(
-                self._video_payload()
-            )
+            result = OpenAIVideoSyncAdapter(ep, LOGGER).invoke(self._video_payload())
 
         assert post.call_args.kwargs["headers"]["NVCF-POLL-SECONDS"] == "119"
         assert get.call_args_list[0].args[0] == "https://status.internal.test/x/req%2F1"
@@ -569,8 +567,7 @@ class TestOpenAIVideoSyncAdapter:
         assert result.request_id == "req/1"
 
     def test_control_inputs_become_extra_params_control_path(self):
-        # vllm-omni transfer: a control input is referenced by PATH in extra_params
-        # (server-read), NOT uploaded; a modality the config already set is kept.
+        # Keep the legacy path contract for non-WSM control inputs.
         ep = _endpoint(role="video_transfer", url="http://host:8000", model="")
         payload = {
             "prompt": "night snow",
@@ -603,6 +600,50 @@ class TestOpenAIVideoSyncAdapter:
         assert extra["depth"] == {"control_path": "/data/depth.mp4"}
         # only the primary rgb is uploaded; control bytes are NOT sent.
         assert kwargs["files"]["input_reference"][1] == PNG_BYTES
+
+    def test_wsm_control_is_uploaded_with_rgb(self):
+        ep = _endpoint(role="video_transfer", url="http://host:8000", model="")
+        payload = {
+            "prompt": "night snow",
+            "media": {
+                "rgb": {
+                    "bytes": b"RGB-MP4",
+                    "mime": "video/mp4",
+                    "path": "RGB.mp4",
+                    "kind": "video",
+                },
+                "wsm": {
+                    "bytes": b"WSM-MP4",
+                    "mime": "video/mp4",
+                    "path": "/data/WSM_RGB.mp4",
+                    "kind": "control",
+                },
+            },
+            "params": {
+                "extra_params": {"wsm": {"control_weight": 0.75}},
+            },
+        }
+        with patch(
+            "generation.adapters.openai_video_sync.requests.post",
+            return_value=self._resp(),
+        ) as post:
+            OpenAIVideoSyncAdapter(ep, LOGGER).invoke(payload)
+
+        kwargs = post.call_args[1]
+        assert kwargs["data"]["control_type"] == "wsm"
+        assert json.loads(kwargs["data"]["extra_params"])["wsm"] == {
+            "control_weight": 0.75
+        }
+        assert kwargs["files"]["input_reference"] == (
+            "RGB.mp4",
+            b"RGB-MP4",
+            "video/mp4",
+        )
+        assert kwargs["files"]["control_reference"] == (
+            "WSM_RGB.mp4",
+            b"WSM-MP4",
+            "video/mp4",
+        )
 
     def test_text_only_forces_multipart(self):
         # No input frame: the request must still be multipart (data= alone would
@@ -817,6 +858,68 @@ class TestOpenAIVideoAsyncAdapter:
         with pytest.raises(ValueError, match=r"control inputs \['depth'\]"):
             adapter.invoke(payload)
 
+    def test_create_defensively_rejects_non_wsm_control(self):
+        payload = self._payload()
+        payload["media"]["depth"] = {
+            "bytes": PNG_BYTES,
+            "mime": "video/mp4",
+            "path": "d.mp4",
+            "kind": "control",
+        }
+        adapter = OpenAIVideoAsyncAdapter(self._endpoint(role="video_transfer"), LOGGER)
+
+        with pytest.raises(ValueError, match=r"control inputs \['depth'\]"):
+            adapter._create(payload, float("inf"))
+
+    def test_cosmos3_wsm_control_is_uploaded_with_rgb(self):
+        created = self._job({"id": "wsm-job", "status": "processing"})
+        done = self._job({"id": "wsm-job", "status": "completed"})
+        download = self._video(self.MP4_BYTES)
+        payload = {
+            "prompt": "follow the WSM control",
+            "media": {
+                "rgb": {
+                    "bytes": b"RGB-MP4",
+                    "mime": "video/mp4",
+                    "path": "RGB.mp4",
+                    "kind": "video",
+                },
+                "wsm": {
+                    "bytes": b"WSM-MP4",
+                    "mime": "video/mp4",
+                    "path": "/data/WSM_RGB.mp4",
+                    "kind": "control",
+                },
+            },
+            "params": {"extra_params": {"wsm": {"control_weight": 0.75}}},
+        }
+        with (
+            patch(self.POST, return_value=created) as post,
+            patch(self.GET, side_effect=[done, download]),
+            patch(self.SLEEP),
+        ):
+            adapter = OpenAIVideoAsyncAdapter(
+                self._endpoint(role="video_transfer", model="nvidia/Cosmos3-Super"),
+                LOGGER,
+            )
+            adapter.invoke(payload)
+
+        kwargs = post.call_args[1]
+        assert kwargs["data"]["control_type"] == "wsm"
+        assert json.loads(kwargs["data"]["extra_params"])["wsm"] == {
+            "control_weight": 0.75
+        }
+        assert kwargs["files"]["input_reference"] == (
+            "RGB.mp4",
+            b"RGB-MP4",
+            "video/mp4",
+        )
+        assert kwargs["files"]["control_reference"] == (
+            "WSM_RGB.mp4",
+            b"WSM-MP4",
+            "video/mp4",
+        )
+
     def test_bearer_auth_header_sent(self, monkeypatch):
         monkeypatch.setenv("ASYNC_KEY", "sk-xyz")
         created = self._job({"id": "v1", "status": "processing"})
@@ -850,6 +953,81 @@ class TestOpenAIVideoAsyncAdapter:
             adapter = OpenAIVideoAsyncAdapter(self._endpoint(), LOGGER)
             with pytest.raises(RuntimeError, match="safety blocked"):
                 adapter.invoke(self._payload())
+
+    @pytest.mark.parametrize(
+        "poll_error",
+        [
+            requests.ReadTimeout("status request stalled"),
+            requests.ConnectionError("status connection dropped"),
+        ],
+    )
+    def test_transient_poll_error_reuses_submitted_job(self, poll_error):
+        created = self._job({"id": "v1", "status": "processing"})
+        done = self._job({"id": "v1", "status": "completed"})
+        download = self._video(self.MP4_BYTES)
+        with (
+            patch(self.POST, return_value=created) as post,
+            patch(self.GET, side_effect=[poll_error, done, download]) as get,
+            patch(self.SLEEP) as sleep,
+        ):
+            adapter = OpenAIVideoAsyncAdapter(self._endpoint(), LOGGER)
+            result = adapter.invoke(self._payload())
+
+        assert result.request_id == "v1"
+        assert result.media_bytes == self.MP4_BYTES
+        post.assert_called_once()
+        assert [call.args[0] for call in get.call_args_list] == [
+            "https://host/videos/v1",
+            "https://host/videos/v1",
+            "https://host/videos/v1/content",
+        ]
+        sleep.assert_called_once()
+
+    def test_repeated_poll_timeouts_end_at_job_deadline(self):
+        now = [0.0]
+
+        def timed_out_get(_url, *, timeout, **_kwargs):
+            now[0] += timeout
+            raise requests.ReadTimeout("status request stalled")
+
+        def advance_clock(seconds):
+            now[0] += seconds
+
+        with (
+            patch(self.GET, side_effect=timed_out_get) as get,
+            patch(self.SLEEP, side_effect=advance_clock) as sleep,
+            patch(
+                "generation.adapters.openai_video_async.time.monotonic",
+                side_effect=lambda: now[0],
+            ),
+        ):
+            adapter = OpenAIVideoAsyncAdapter(self._endpoint(timeout=250), LOGGER)
+            with pytest.raises(TimeoutError, match="video job v1 did not complete"):
+                adapter._poll("v1", deadline=250)
+
+        assert get.call_count == 2
+        assert [call.kwargs["timeout"] for call in get.call_args_list] == [120, 120]
+        assert [call.args[0] for call in get.call_args_list] == [
+            "https://host/videos/v1",
+            "https://host/videos/v1",
+        ]
+        assert [call.args[0] for call in sleep.call_args_list] == [8, 2]
+
+    def test_poll_http_error_does_not_retry(self):
+        created = self._job({"id": "v1", "status": "processing"})
+        denied = self._job({}, status=403, text="forbidden")
+        with (
+            patch(self.POST, return_value=created) as post,
+            patch(self.GET, return_value=denied) as get,
+            patch(self.SLEEP) as sleep,
+        ):
+            adapter = OpenAIVideoAsyncAdapter(self._endpoint(), LOGGER)
+            with pytest.raises(requests.HTTPError, match="HTTP 403"):
+                adapter.invoke(self._payload())
+
+        post.assert_called_once()
+        get.assert_called_once()
+        sleep.assert_not_called()
 
     def test_create_error_surfaces_response_body(self):
         bad = self._job(

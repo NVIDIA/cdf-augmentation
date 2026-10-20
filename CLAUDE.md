@@ -9,7 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv run modules/cli.py --config configs/<config_file>.yaml
 
 # Run with OmegaConf CLI overrides
-uv run modules/cli.py --config configs/cookbook/video-data-augmentation/config_video_transfer_CT25_nim.yaml data.0.inputs.rgb=/path/to/video.mp4
+uv run modules/cli.py --config configs/<config_file>.yaml \
+  data.0.inputs.rgb=/path/to/video.mp4
 
 # Run tests
 uv run pytest tests/
@@ -25,16 +26,18 @@ uv run ruff format --check modules/
 docker run --rm --network host \
   -v "$(pwd)/configs:/workspace/configs" \
   -v "$(pwd)/data:/workspace/data" \
-  paidf-augmentation:1.1.0 \
+  nvcr.io/nvidia/cdf-augmentation:1.2.0 \
   --config configs/<config_file>.yaml
 ```
 
 Add `--env-file examples/.env` only when an endpoint needs an API key.
 
 Add `--gpus` only for the `data_processing.alignment` post-processor (cupy) and
-whenever **H.264** must be decoded (the evaluators and `data_processing.transcode`),
+whenever a configured stage must decode **H.264** locally,
 since the image ships only the hardware `h264_cuvid` decoder. VP9 decodes in software.
 `--network host` is needed only to reach endpoints on the host's `localhost`.
+For VDA-specific service and network setup, see
+[`configs/cookbook/video-data-augmentation/README.md`](configs/cookbook/video-data-augmentation/README.md).
 
 ## Architecture
 
@@ -52,7 +55,7 @@ All YAML configs are validated against a single `PipelineConfig` root model. The
 | `captioning` | `vlm`, `llm`, and/or `template` sub-sections — captioner type is **inferred from which sub-sections are present** |
 | `augmentation` | Model name (free-form string), generation parameters, control modalities |
 | `data_processing` | `preprocessing.resize` (before generation), `alignment` and `transcode` (after) |
-| `evaluators` | Ordered list of hallucination_check, attribute_verification, vlm_verification |
+| `evaluators` | Ordered quality checks configured for the pipeline |
 
 Cross-section validation in `config.py` ensures endpoint requirements match the configured model and captioning strategy.
 

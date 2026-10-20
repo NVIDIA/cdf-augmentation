@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class ControlInputs(BaseModel):
-    """Optional control modality paths (used only for Cosmos Transfer 2.5)."""
+    """Optional control modality paths for Cosmos video transfer."""
 
     edge: Optional[str] = Field(default=None, description="Edge control video path")
     depth: Optional[str] = Field(default=None, description="Depth control video path")
@@ -18,6 +18,9 @@ class ControlInputs(BaseModel):
     )
     vis: Optional[str] = Field(
         default=None, description="Visibility control video path"
+    )
+    wsm: Optional[str] = Field(
+        default=None, description="World scenario model (WSM) control video path"
     )
 
 
@@ -48,7 +51,7 @@ class DataInputs(BaseModel):
     )
     controls: Optional[ControlInputs] = Field(
         default=None,
-        description="Control modality inputs (only for Cosmos Transfer 2.5)",
+        description="Control modality inputs for Cosmos video transfer",
     )
     prompt_attributes: Optional[PromptAttributes] = Field(
         default=None,

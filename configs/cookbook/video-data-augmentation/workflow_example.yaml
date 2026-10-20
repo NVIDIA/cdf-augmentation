@@ -1,7 +1,7 @@
 data_dir: /path/to/input_media
 n_augmentations: 4
 config_output: /path/to/generated_configs
-example_augmentation_config: config_video_transfer_CT25_nim.yaml
+example_augmentation_config: config_video_transfer_CT3_omni.yaml
 variables:
   weather: {"clear": 0.5, "cloudy": 0.25, "rainy": 0.15, "snowy": 0.1}
   time_of_day: {"dawn": 0.0, "day": 0.5, "dusk": 0.0, "night": 0.5}

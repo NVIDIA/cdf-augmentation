@@ -4,7 +4,7 @@
 """Root pipeline configuration model with cross-section validation."""
 
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -13,6 +13,7 @@ from aug_utils.endpoint_registry import (
     resolve_endpoint,
     select_endpoint,
 )
+from aug_utils.stream_keys import resolve_stream_key
 
 from .adapters import KNOWN_ADAPTERS
 from .augmentation import AugmentationConfig
@@ -24,9 +25,41 @@ from .evaluators import EvaluatorEntry
 from .pipeline import PipelineSettings
 
 
+COSMOS_EVALUATOR_ADAPTER = "cosmos.evaluator.arbitrator"
+
+# Root fields written by cli.py independently of evaluator aliases. Built-in
+# evaluator blocks are handled separately because only enabled evaluators write
+# them; the Cosmos provider block is reserved unconditionally below.
+_ROOT_METADATA_FIELDS = frozenset(
+    {
+        "prompt",
+        "selections",
+        "caption_path",
+        "output_media_path",
+        "input_media_path",
+        "control_media",
+        "prompt_builder",
+        "scene_description",
+        "scene_description_source",
+        "captioning",
+        "endpoints",
+        "natural_caption",
+        "alignment",
+        "transcode",
+    }
+)
+
+
 def _has_role(endpoints: List[Endpoint], role: str) -> bool:
     """Return True when at least one endpoint declares ``role``."""
     return any(getattr(ep, "role", None) == role for ep in endpoints)
+
+
+def _is_remote_path(path: Any) -> bool:
+    """Call the pipeline's storage-path classifier without an import cycle."""
+    from aug_utils.common import is_remote_path
+
+    return isinstance(path, str) and is_remote_path(path)
 
 
 class PipelineConfig(BaseModel):
@@ -254,6 +287,136 @@ class PipelineConfig(BaseModel):
                     f"evaluators[{idx}].vlm_verification",
                 )
 
+        enabled_cosmos = [
+            (idx, entry.cosmos_evaluator)
+            for idx, entry in enumerate(self.evaluators or [])
+            if entry.cosmos_evaluator is not None and entry.cosmos_evaluator.enabled
+        ]
+        if len(enabled_cosmos) > 1:
+            raise ValueError(
+                "at most one enabled cosmos_evaluator entry is allowed, "
+                f"got {len(enabled_cosmos)}"
+            )
+
+        if enabled_cosmos:
+            idx, cosmos = enabled_cosmos[0]
+            try:
+                evaluator_endpoint = select_endpoint(
+                    self.endpoints,
+                    "evaluator",
+                    cosmos.endpoint_id,
+                    required=True,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"evaluators[{idx}].cosmos_evaluator.endpoint_id: {exc}"
+                ) from exc
+            if evaluator_endpoint.adapter != COSMOS_EVALUATOR_ADAPTER:
+                raise ValueError(
+                    f"evaluators[{idx}].cosmos_evaluator endpoint "
+                    f"{cosmos.endpoint_id!r} must explicitly use adapter "
+                    f"{COSMOS_EVALUATOR_ADAPTER!r}"
+                )
+
+            for sample_idx, sample in enumerate(self.data):
+                inputs = sample.inputs
+                if inputs is not None:
+                    if inputs.rgb is not None and not _is_remote_path(inputs.rgb):
+                        raise ValueError(
+                            f"data[{sample_idx}].inputs.rgb must be externally "
+                            "readable when cosmos_evaluator is enabled"
+                        )
+                    controls = inputs.controls
+                    if controls is not None:
+                        for control_name, control_path in controls.model_dump(
+                            exclude_none=True
+                        ).items():
+                            if not _is_remote_path(control_path):
+                                raise ValueError(
+                                    f"data[{sample_idx}].inputs.controls."
+                                    f"{control_name} must be externally readable "
+                                    "when cosmos_evaluator is enabled"
+                                )
+                if not _is_remote_path(sample.output.video):
+                    raise ValueError(
+                        f"data[{sample_idx}].output.video must be externally "
+                        "readable when cosmos_evaluator is enabled"
+                    )
+
+            if cosmos.stream_key is not None:
+                required_stream_keys = {cosmos.stream_key}
+            else:
+                required_stream_keys = {
+                    resolve_stream_key(sample.output.video) for sample in self.data
+                }
+
+            for field_name in ("original_video_urls", "world_model_video_urls"):
+                value = cosmos.inputs.get(field_name)
+                if value is None:
+                    continue
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"evaluators[{idx}].cosmos_evaluator.inputs.{field_name} "
+                        "must be a mapping of stream key to remote URI"
+                    )
+                for stream_key, media_path in value.items():
+                    if not isinstance(stream_key, str) or not stream_key.strip():
+                        raise ValueError(
+                            f"evaluators[{idx}].cosmos_evaluator.inputs."
+                            f"{field_name} contains a blank stream key"
+                        )
+                    if not _is_remote_path(media_path):
+                        raise ValueError(
+                            f"evaluators[{idx}].cosmos_evaluator.inputs."
+                            f"{field_name}[{stream_key!r}] must be externally readable"
+                        )
+                missing_stream_keys = sorted(required_stream_keys.difference(value))
+                if missing_stream_keys:
+                    raise ValueError(
+                        f"evaluators[{idx}].cosmos_evaluator.inputs.{field_name} "
+                        f"lacks resolved stream key(s): {missing_stream_keys}"
+                    )
+
+            rds_hq_url = cosmos.inputs.get("rds_hq_url")
+            if rds_hq_url is not None and not _is_remote_path(rds_hq_url):
+                raise ValueError(
+                    f"evaluators[{idx}].cosmos_evaluator.inputs.rds_hq_url "
+                    "must be externally readable"
+                )
+
+            enabled_builtin_keys = set()
+            for entry in self.evaluators or []:
+                hc = entry.hallucination_check
+                if hc is not None and hc.enabled:
+                    enabled_builtin_keys.add("hallucination_check")
+                av = entry.attribute_verification
+                if av is not None and av.enabled:
+                    enabled_builtin_keys.add("attribute_verification")
+
+            aliases = set()
+            for check in cosmos.checks:
+                alias = check.metadata_key
+                if alias is None:
+                    continue
+                if alias == "cosmos_evaluator":
+                    raise ValueError(
+                        "Cosmos metadata_key 'cosmos_evaluator' is reserved for "
+                        "the provider block"
+                    )
+                if alias in _ROOT_METADATA_FIELDS:
+                    raise ValueError(
+                        f"Cosmos metadata_key {alias!r} collides with an existing "
+                        "root metadata field"
+                    )
+                if alias in enabled_builtin_keys:
+                    raise ValueError(
+                        f"Cosmos metadata_key {alias!r} collides with an enabled "
+                        "built-in evaluator"
+                    )
+                if alias in aliases:
+                    raise ValueError(f"duplicate Cosmos metadata_key alias {alias!r}")
+                aliases.add(alias)
+
         return self
 
     def _endpoint_selectors(self):
@@ -290,4 +453,11 @@ class PipelineConfig(BaseModel):
                     f"evaluators[{idx}].vlm_verification.endpoint_id",
                     "vlm",
                     vv.endpoint_id,
+                )
+            cosmos = entry.cosmos_evaluator
+            if cosmos is not None and cosmos.enabled:
+                yield (
+                    f"evaluators[{idx}].cosmos_evaluator.endpoint_id",
+                    "evaluator",
+                    cosmos.endpoint_id,
                 )

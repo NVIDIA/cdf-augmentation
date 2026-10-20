@@ -6,12 +6,18 @@
 Evaluators are specified as a list, where each entry contains exactly one of:
 - ``hallucination_check``
 - ``attribute_verification`` (may contain an inline ``vlm_verification``)
-- ``vlm_verification`` (standalone, without attribute verification)
+- ``cosmos_evaluator`` (external Cosmos Evaluator Arbitrator)
+
+The legacy standalone ``vlm_verification`` field remains parseable only so the
+validator can return a targeted migration error. It has no independent
+question or acceptance contract and therefore must never validate as an
+executable evaluator.
 """
 
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .base import BaseInferenceParameters
 
@@ -149,6 +155,152 @@ class AttributeVerificationEvaluator(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# External Cosmos Evaluator
+# ---------------------------------------------------------------------------
+
+
+class CosmosEvaluatorCheck(BaseModel):
+    """One checker selected from an external Cosmos Evaluator deployment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Free-form checker name advertised by Arbitrator")
+    gate: bool = Field(description="Whether this check affects candidate acceptance")
+    metadata_key: Optional[str] = Field(
+        default=None,
+        description="Optional root-level compatibility alias for this check's result",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """Checker names are opaque but must be non-empty."""
+        value = value.strip()
+        if not value:
+            raise ValueError("Cosmos checker name must not be blank")
+        return value
+
+    @field_validator("metadata_key")
+    @classmethod
+    def validate_metadata_key(cls, value: Optional[str]) -> Optional[str]:
+        """Compatibility aliases, when supplied, must be non-empty."""
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("Cosmos checker metadata_key must not be blank")
+        return value
+
+
+class CosmosEvaluator(BaseModel):
+    """External Cosmos Evaluator Arbitrator configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True)
+    endpoint_id: str = Field(
+        description="Select an endpoints[] entry with role 'evaluator'"
+    )
+    poll_interval_seconds: float = Field(default=5.0, gt=0.0)
+    stream_key: Optional[str] = Field(
+        default=None,
+        description="Stable per-stream key; derived from output.video when omitted",
+    )
+    output_storage_prefix: Optional[str] = Field(
+        default=None,
+        description="Relative object-storage key prefix for checker artifacts",
+    )
+    checks: List[CosmosEvaluatorCheck] = Field(min_length=1)
+    inputs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional Arbitrator inputs; augmented_video_urls is runtime-owned",
+    )
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Shared opaque config forwarded to every selected checker",
+    )
+    merge_captioning_selections: bool = Field(default=False)
+
+    @field_validator("endpoint_id")
+    @classmethod
+    def validate_endpoint_id(cls, value: str) -> str:
+        """The evaluator endpoint selector must be explicit and non-empty."""
+        value = value.strip()
+        if not value:
+            raise ValueError("Cosmos evaluator endpoint_id must not be blank")
+        return value
+
+    @field_validator("stream_key")
+    @classmethod
+    def validate_stream_key(cls, value: Optional[str]) -> Optional[str]:
+        """Normalize an explicit stream key without changing its contents."""
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("Cosmos evaluator stream_key must not be blank")
+        return value
+
+    @field_validator("output_storage_prefix")
+    @classmethod
+    def strip_output_storage_prefix(cls, value: Optional[str]) -> Optional[str]:
+        """Strip only surrounding whitespace; preserve an optional trailing slash."""
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_cosmos_contract(self):
+        """Validate checker uniqueness and Arbitrator-owned request fields."""
+        names = [check.name for check in self.checks]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate Cosmos checker names: {duplicates}")
+
+        if "augmented_video_urls" in self.inputs:
+            raise ValueError(
+                "cosmos_evaluator.inputs.augmented_video_urls is reserved for "
+                "the generated candidate"
+            )
+
+        prefix = self.output_storage_prefix
+        if self.enabled and not prefix:
+            raise ValueError(
+                "output_storage_prefix is required when cosmos_evaluator is enabled"
+            )
+        if not prefix:
+            return self
+
+        if prefix.startswith("/"):
+            raise ValueError("output_storage_prefix must not start with '/'")
+        if "\\" in prefix:
+            raise ValueError("output_storage_prefix must not contain backslashes")
+        if any(ord(char) < 32 or ord(char) == 127 for char in prefix):
+            raise ValueError(
+                "output_storage_prefix must not contain ASCII control characters"
+            )
+
+        try:
+            parsed = urlsplit(prefix)
+        except ValueError as exc:
+            raise ValueError(
+                "output_storage_prefix must be a relative key prefix"
+            ) from exc
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+            raise ValueError(
+                "output_storage_prefix must be a relative key prefix without a "
+                "scheme, authority, query, or fragment"
+            )
+
+        segments = parsed.path.split("/")
+        if segments and segments[-1] == "":
+            segments = segments[:-1]
+        if any(segment in ("", ".", "..") for segment in segments):
+            raise ValueError(
+                "output_storage_prefix must not contain empty, '.', or '..' path segments"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Evaluator Entry (list item)
 # ---------------------------------------------------------------------------
 
@@ -156,7 +308,7 @@ class AttributeVerificationEvaluator(BaseModel):
 class EvaluatorEntry(BaseModel):
     """A single entry in the ``evaluators`` list.
 
-    Exactly one of the three evaluator fields must be set.
+    Exactly one evaluator field must be set.
     """
 
     hallucination_check: Optional[HallucinationCheckEvaluator] = Field(default=None)
@@ -164,6 +316,7 @@ class EvaluatorEntry(BaseModel):
         default=None
     )
     vlm_verification: Optional[VLMVerificationEvaluator] = Field(default=None)
+    cosmos_evaluator: Optional[CosmosEvaluator] = Field(default=None)
 
     @model_validator(mode="after")
     def exactly_one_evaluator(self):
@@ -174,6 +327,7 @@ class EvaluatorEntry(BaseModel):
                 "hallucination_check",
                 "attribute_verification",
                 "vlm_verification",
+                "cosmos_evaluator",
             )
             if getattr(self, f) is not None
         ]
@@ -181,5 +335,11 @@ class EvaluatorEntry(BaseModel):
             raise ValueError(
                 f"Each evaluator entry must specify exactly one evaluator type, "
                 f"got {len(set_fields)}: {set_fields}"
+            )
+        if self.vlm_verification is not None:
+            raise ValueError(
+                "standalone vlm_verification is not supported; move it under "
+                "attribute_verification.vlm_verification so the pipeline has "
+                "questions and expected answers to evaluate"
             )
         return self

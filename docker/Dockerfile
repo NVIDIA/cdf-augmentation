@@ -170,7 +170,7 @@ RUN apt-get purge -y --auto-remove yasm nasm && rm -rf /var/lib/apt/lists/*
 
 # Install uv system-wide. Tag + multi-arch manifest digest pinned so the copied
 # binary can't drift from the archived source tarball, and ARM64 stays intact.
-COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a /uv /uvx /usr/local/bin/
 ENV PATH="/usr/local/bin:$PATH"
 # Put uv and Python in a location we can chown for the non-root user. Use a
 # disposable cache outside /root from the first build-time invocation so
@@ -183,7 +183,7 @@ ENV UV_HOME=/opt/uv \
 # otherwise `uv run` fails to canonicalize the venv interpreter symlink. /opt/uv
 # is chowned to the nvidia user further down, so the interpreter resolves.
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-ARG UV_VERSION=0.12.5
+ARG UV_VERSION=0.12.24
 RUN mkdir -p /opt/uv /usr/share/oss-sources && \
     curl -fsSL "https://github.com/astral-sh/uv/archive/refs/tags/${UV_VERSION}.tar.gz" \
         -o "/usr/share/oss-sources/uv-${UV_VERSION}.tar.gz"
@@ -198,10 +198,10 @@ COPY configs /workspace/configs
 # re-resolve at build time. `uv sync --locked` below fails if it drifts.
 COPY pyproject.toml uv.lock ./
 
-# Python 3.13 to match the repo's .python-version (3.13.15); pinned to a full
+# Python 3.13 to match the repo's .python-version (3.13.16); pinned to a full
 # patch for reproducibility.
-ARG PYTHON_VERSION=3.13.15
-ARG PYTHON_SHA256=1e66a7945a48390ee4c2a4268a0e4185884059a13c4aab6d148aa208deea4a76
+ARG PYTHON_VERSION=3.13.16
+ARG PYTHON_SHA256=f4b1bfb3c79b5bb11b8d228a12504163b4c0dab4d679828d8f5f26b6cb6ab35d
 # Install the requested CPython and preserve the matching upstream source
 # tarball for OSS compliance (PYTHON_VERSION is a full pinned patch version).
 RUN set -euxo pipefail; \
@@ -302,16 +302,35 @@ RUN rm -rf /root/.cache/uv /tmp/uv-cache && \
     test ! -e /root/.cache/uv && \
     test ! -e /tmp/uv-cache
 
-# Remove build-only packages to shrink attack surface.
-RUN apt-get update \
-    && apt-get purge -y --auto-remove \
+# Remove build-only packages to shrink attack surface. Nsight Compute ships with
+# the CUDA devel base but is a GPU profiler this endpoint-only image never runs;
+# its bundled Go plugin (plugins/efa_metrics/nic_sampler, built with go1.23.4)
+# pulls every Go stdlib/toolchain CVE into the container scan. Its packages are
+# matched by pattern so the purge keeps working on arm64 and across base bumps.
+# The apt-get upgrade re-applies Ubuntu security updates: the upgrade in the
+# first apt layer is served from CI's registry cache, so it can lag the archive
+# (e.g. libssl3t64/openssl). This layer rebuilds whenever source changes.
+RUN set -euxo pipefail; \
+    nsight_pkgs="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+        'cuda-nsight-compute-*' 'nsight-compute-*' 2>/dev/null \
+        | awk '$1 == "ii" {print $2}' || true)"; \
+    apt-get update; \
+    apt-get purge -y --auto-remove \
         build-essential \
         cmake \
         ninja-build \
         pkg-config \
         git \
         libgnutls28-dev \
-    && rm -rf /var/lib/apt/lists/*
+        ${nsight_pkgs}; \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends; \
+    rm -rf /opt/nvidia/nsight-compute /var/lib/apt/lists/*
+
+# Defensive scan: fail if any Go binary is left. Scanners report every Go
+# stdlib CVE for the toolchain a binary was built with, and nothing in this
+# image needs Go.
+RUN go_bins="$(grep -rlas -F 'Go buildinf:' /usr /opt /workspace || true)"; \
+    if [ -n "$go_bins" ]; then echo "Unexpected Go binaries:"; echo "$go_bins"; exit 1; fi
 
 # Ensure non-root user can use the app and venv interpreter (UV_HOME)
 RUN chown -R nvidia:nvidia /workspace /opt/uv

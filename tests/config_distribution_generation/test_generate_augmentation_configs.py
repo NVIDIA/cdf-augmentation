@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -9,15 +10,105 @@ import yaml
 
 from modules.config_distribution_generation.generate_augmentation_configs import (
     _is_image_to_video_config,
+    create_augmentation_config,
     create_seed_image_t2i_config,
     generate_configs,
     generate_output_paths,
     parse_distribution,
     sample_variable_values,
 )
+from aug_utils.schema import PipelineConfig
+from aug_utils.stream_keys import resolve_stream_key
 
 
 LOGGER = logging.getLogger(__name__)
+CONFIG_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "configs"
+    / "cookbook"
+    / "video-data-augmentation"
+)
+
+
+def _external_cosmos_template():
+    return {
+        "data": [
+            {
+                "inputs": {"rgb": "s3://bucket/template/input.mp4"},
+                "output": {
+                    "prefix": "template/run",
+                    "video": "s3://bucket/template/output.mp4",
+                    "caption": "s3://bucket/template/output.txt",
+                    "metadata": "s3://bucket/template/metadata.json",
+                    "evaluation": "s3://bucket/template/evaluation.json",
+                },
+            }
+        ],
+        "endpoints": [
+            {"id": "vlm", "role": "vlm", "url": "http://vlm:8000/v1"},
+            {"id": "llm", "role": "llm", "url": "http://llm:8002/v1"},
+            {
+                "id": "transfer",
+                "role": "video_transfer",
+                "url": "http://transfer:8000",
+                "adapter": "nim",
+            },
+            {
+                "id": "cosmos_evaluator",
+                "role": "evaluator",
+                "url": "http://arbitrator:8000",
+                "adapter": "cosmos.evaluator.arbitrator",
+            },
+        ],
+        "pipeline": {"retry": 0},
+        "captioning": {
+            "llm": {
+                "text": "Weather {weather}; time {time_of_day}",
+                "variables": {"weather": ["snowy"], "time_of_day": ["night"]},
+            }
+        },
+        "augmentation": {
+            "model": {"name": "cosmos-transfer2.5"},
+            "parameters": {"seed": 42},
+        },
+        "evaluators": [
+            {
+                "cosmos_evaluator": {
+                    "enabled": True,
+                    "endpoint_id": "cosmos_evaluator",
+                    "stream_key": "camera_front",
+                    "output_storage_prefix": "template/cosmos-evaluator/",
+                    "inputs": {
+                        "original_video_urls": {
+                            "camera_front": "s3://bucket/template/input.mp4"
+                        }
+                    },
+                    "checks": [
+                        {
+                            "name": "metropolis.hallucination",
+                            "gate": True,
+                            "metadata_key": "hallucination_check",
+                        },
+                        {
+                            "name": "metropolis.attribute_verification",
+                            "gate": True,
+                            "metadata_key": "attribute_verification",
+                        },
+                    ],
+                    "config": {
+                        "selected_variables": {
+                            "weather": "snowy",
+                            "time_of_day": "night",
+                        },
+                        "variable_options": {
+                            "weather": ["sunny", "cloudy", "rainy", "snowy"],
+                            "time_of_day": ["morning", "night"],
+                        },
+                    },
+                }
+            }
+        ],
+    }
 
 
 def test_parse_distribution_accepts_native_dict():
@@ -311,3 +402,247 @@ def test_event_video_distribution_generates_runnable_mp4_output(tmp_path):
     assert config["captioning"]["llm"]["variables"] == {
         "anomaly_type": ["person_falling"]
     }
+
+
+def test_external_cosmos_batch_config_synchronizes_media_and_selections():
+    sampled = {
+        "weather": "rainy",
+        "time_of_day": "morning",
+        "road_condition": "wet",
+    }
+    generated = create_augmentation_config(
+        _external_cosmos_template(),
+        "s3://bucket/input/camera.mp4",
+        sampled,
+        aug_index=2,
+        data_dir="s3://bucket/input",
+        output_root="s3://bucket/output/run-42",
+        logger=LOGGER,
+    )
+
+    data = generated["data"][0]
+    assert data["inputs"]["rgb"] == "s3://bucket/input/camera.mp4"
+    assert data["output"] == {
+        "prefix": "output/run-42/camera/aug_2",
+        "video": "s3://bucket/output/run-42/camera/aug_2/output.mp4",
+        "caption": "s3://bucket/output/run-42/camera/aug_2/output_prompt.txt",
+        "metadata": "s3://bucket/output/run-42/camera/aug_2/output_metadata.json",
+        "evaluation": "s3://bucket/output/run-42/camera/aug_2/evaluation.json",
+    }
+
+    cosmos = generated["evaluators"][0]["cosmos_evaluator"]
+    assert cosmos["inputs"]["original_video_urls"] == {
+        "camera_front": data["inputs"]["rgb"]
+    }
+    assert cosmos["output_storage_prefix"] == (
+        "output/run-42/camera/aug_2/cosmos-evaluator/"
+    )
+    assert cosmos["config"]["selected_variables"] == {
+        "weather": "rainy",
+        "time_of_day": "morning",
+    }
+    assert "road_condition" not in cosmos["config"]["selected_variables"]
+    assert cosmos["config"]["variable_options"] == {
+        "weather": ["sunny", "cloudy", "rainy", "snowy"],
+        "time_of_day": ["morning", "night"],
+    }
+    PipelineConfig(**generated)
+
+    next_generated = create_augmentation_config(
+        _external_cosmos_template(),
+        "s3://bucket/input/camera.mp4",
+        sampled,
+        aug_index=3,
+        data_dir="s3://bucket/input",
+        output_root="s3://bucket/output/run-42",
+        logger=LOGGER,
+    )
+    next_cosmos = next_generated["evaluators"][0]["cosmos_evaluator"]
+    assert next_cosmos["output_storage_prefix"] != cosmos["output_storage_prefix"]
+
+
+def test_external_cosmos_batch_config_requires_stream_companion():
+    template = _external_cosmos_template()
+    template["evaluators"][0]["cosmos_evaluator"]["inputs"] = {}
+
+    with pytest.raises(ValueError, match="original_video_urls"):
+        create_augmentation_config(
+            template,
+            "s3://bucket/input/camera.mp4",
+            {"weather": "snowy", "time_of_day": "night"},
+            aug_index=0,
+            data_dir="s3://bucket/input",
+            output_root="s3://bucket/output/run-42",
+            logger=LOGGER,
+        )
+
+
+@pytest.mark.parametrize("companion", ["/tmp/input.mp4", "msc://profile/input.mp4"])
+def test_external_cosmos_batch_config_rejects_invalid_stream_companion(companion):
+    template = _external_cosmos_template()
+    cosmos = template["evaluators"][0]["cosmos_evaluator"]
+    cosmos["inputs"]["original_video_urls"]["camera_front"] = companion
+
+    with pytest.raises(ValueError, match="template's existing"):
+        create_augmentation_config(
+            template,
+            "s3://bucket/input/camera.mp4",
+            {"weather": "snowy", "time_of_day": "night"},
+            aug_index=0,
+            data_dir="s3://bucket/input",
+            output_root="s3://bucket/output/run-42",
+            logger=LOGGER,
+        )
+
+
+def test_external_cosmos_batch_config_rejects_local_hallucination_input():
+    with pytest.raises(ValueError, match=r"data\[0\]\.inputs\.rgb"):
+        create_augmentation_config(
+            _external_cosmos_template(),
+            "/tmp/camera.mp4",
+            {"weather": "snowy", "time_of_day": "night"},
+            aug_index=0,
+            data_dir="/tmp",
+            output_root="s3://bucket/output/run-42",
+            logger=LOGGER,
+        )
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_count"),
+    [
+        (["sunny", "cloudy", "snowy"], 0),
+        (["sunny", "rainy", "rainy", "snowy"], 2),
+    ],
+)
+def test_external_cosmos_batch_config_rejects_invalid_option_pool(
+    options, expected_count
+):
+    template = _external_cosmos_template()
+    cosmos = template["evaluators"][0]["cosmos_evaluator"]
+    cosmos["config"]["variable_options"]["weather"] = options
+
+    with pytest.raises(ValueError, match=f"found {expected_count}"):
+        create_augmentation_config(
+            template,
+            "s3://bucket/input/camera.mp4",
+            {"weather": "rainy", "time_of_day": "night"},
+            aug_index=0,
+            data_dir="s3://bucket/input",
+            output_root="s3://bucket/output/run-42",
+            logger=LOGGER,
+        )
+
+
+def test_external_cosmos_batch_config_uses_default_option_pool_when_omitted():
+    template = _external_cosmos_template()
+    cosmos = template["evaluators"][0]["cosmos_evaluator"]
+    cosmos["config"].pop("variable_options")
+
+    generated = create_augmentation_config(
+        template,
+        "s3://bucket/input/camera.mp4",
+        {"weather": "rainy", "time_of_day": "night"},
+        aug_index=0,
+        data_dir="s3://bucket/input",
+        output_root="s3://bucket/output/run-42",
+        logger=LOGGER,
+    )
+
+    generated_config = generated["evaluators"][0]["cosmos_evaluator"]["config"]
+    assert generated_config["selected_variables"] == {
+        "weather": "rainy",
+        "time_of_day": "night",
+    }
+    assert "variable_options" not in generated_config
+
+
+def test_non_cosmos_batch_config_preserves_existing_evaluation_behavior():
+    template = {
+        "data": [
+            {
+                "inputs": {"rgb": "/template/input.mp4"},
+                "output": {
+                    "video": "/template/output.mp4",
+                    "caption": "/template/output.txt",
+                    "metadata": "/template/metadata.json",
+                    "evaluation": "${data.0.output.video}_evaluation.json",
+                },
+            }
+        ],
+        "captioning": {"llm": {"variables": {}}},
+        "augmentation": {"parameters": {"seed": 42}},
+    }
+
+    generated = create_augmentation_config(
+        template,
+        "/input/camera.mp4",
+        {"weather": "rainy"},
+        aug_index=1,
+        data_dir="/input",
+        output_root="/output",
+        logger=LOGGER,
+    )
+
+    assert generated["data"][0]["output"]["evaluation"] == (
+        "${data.0.output.video}_evaluation.json"
+    )
+    assert "prefix" not in generated["data"][0]["output"]
+
+
+def test_shipped_ct3_workflow_generates_valid_external_cosmos_configs():
+    workflow = yaml.safe_load((CONFIG_DIR / "workflow_example.yaml").read_text())
+    template = yaml.safe_load(
+        (CONFIG_DIR / workflow["example_augmentation_config"]).read_text()
+    )
+    samples, base_samples = sample_variable_values(
+        workflow["variables"],
+        workflow["conditional_variables"],
+        n_samples=workflow["n_augmentations"],
+        seed=42,
+        logger=LOGGER,
+    )
+
+    cosmos_template = template["evaluators"][0]["cosmos_evaluator"]
+    assert cosmos_template["inputs"]["original_video_urls"] == {
+        "camera_front_wide_120fov": "${data.0.inputs.rgb}"
+    }
+
+    prefixes = set()
+    for aug_index, (sample, base_sample) in enumerate(zip(samples, base_samples)):
+        generated = create_augmentation_config(
+            template,
+            "s3://bucket/input/camera.mp4",
+            sample,
+            aug_index=aug_index,
+            data_dir="s3://bucket/input",
+            output_root="s3://bucket/output/run-007",
+            sampled_base_variables=base_sample,
+            logger=LOGGER,
+        )
+        data = generated["data"][0]
+        cosmos = generated["evaluators"][0]["cosmos_evaluator"]
+        stream_key = resolve_stream_key(
+            data["output"]["video"], cosmos.get("stream_key")
+        )
+
+        assert cosmos["stream_key"] == "camera_front_wide_120fov"
+        assert stream_key == "camera_front_wide_120fov"
+        assert (
+            cosmos["inputs"]["original_video_urls"][stream_key]
+            == (data["inputs"]["rgb"])
+        )
+        assert all(
+            data["output"][field].startswith("s3://bucket/output/run-007/")
+            for field in ("video", "caption", "metadata", "evaluation")
+        )
+        assert cosmos["config"]["selected_variables"] == {
+            "weather": sample["weather"],
+            "time_of_day": sample["time_of_day"],
+        }
+        assert "road_condition" not in cosmos["config"]["selected_variables"]
+        assert "variable_options" not in cosmos["config"]
+        prefixes.add(cosmos["output_storage_prefix"])
+        PipelineConfig(**generated)
+
+    assert len(prefixes) == workflow["n_augmentations"]

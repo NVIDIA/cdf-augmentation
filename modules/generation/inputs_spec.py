@@ -38,9 +38,8 @@ def inputs_spec_for(role: str, inference_type: Optional[str] = None) -> dict:
         }
 
     if role == "video_transfer":
-        # rgb is the primary input; edge/depth/seg/vis are control-modality videos
-        # (kind "control") so the executor tags them and adapters can serialize
-        # them into the request (NIM) or reject them (single-input contracts).
+        # rgb is the primary input; the remaining entries are control-modality
+        # videos (kind "control") so adapters can serialize them per contract.
         return {
             "rgb": {"required": True, "kind": "video"},
             "prompt": {"required": True, "kind": "text"},
@@ -48,6 +47,7 @@ def inputs_spec_for(role: str, inference_type: Optional[str] = None) -> dict:
             "depth": {"required": False, "kind": "control"},
             "seg": {"required": False, "kind": "control"},
             "vis": {"required": False, "kind": "control"},
+            "wsm": {"required": False, "kind": "control"},
         }
 
     if role == "video_predict":

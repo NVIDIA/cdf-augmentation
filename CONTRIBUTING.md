@@ -4,21 +4,21 @@
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.
 
-  * Any contribution which contains commits that are not Signed-Off will not be accepted.
+  * Any contribution that contains commits that are not signed off will not be accepted.
 
-* To sign off on a commit you simply use the `--signoff` (or `-s`) option when committing your changes:
+* To sign off on a commit, use the `--signoff` (or `-s`) option when committing your changes:
 
   ```bash
-  $ git commit -s -m "Add cool feature."
+  $ git commit -s -m "Describe your change."
   ```
 
-  This will append the following to your commit message:
+  This appends the following to your commit message:
 
   ```
   Signed-off-by: Your Name <your@email.com>
   ```
 
-* Full text of the DCO (https://developercertificate.org/):
+* Full text of the [Developer Certificate of Origin (DCO)](https://developercertificate.org/):
 
   ```
     Developer Certificate of Origin

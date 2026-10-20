@@ -1,13 +1,13 @@
 ---
-name: paidf-augmentation
+name: cdf-augmentation
 description: >-
-  Use when authoring or validating PAIDF augmentation YAML configs, or running
-  remote Cosmos Transfer (including Cosmos3 WSM controls), Cosmos Predict,
-  image-edit, or image-to-video inference.
+  Use when authoring or validating Cosmos Data Factory (CDF) augmentation YAML
+  configs, or running remote Cosmos Transfer (including Cosmos3 WSM controls),
+  Cosmos Predict, image-edit, or image-to-video inference.
 license: Apache-2.0
 metadata:
   owner: NVIDIA
-  service: physical-ai-data-factory
+  service: cosmos-data-factory
   version: 1.2.0
   reviewed: '2026-09-16'
   author: "NVIDIA <opensource@nvidia.com>"
@@ -19,7 +19,7 @@ metadata:
     - image-edit
 ---
 
-# PAIDF Augmentation Pipeline Skill
+# CDF Augmentation Pipeline Skill
 
 Remote-API pipeline for captioning, generating, and evaluating augmented camera
 data. Models are configured as HTTP endpoints; no local model weights are
@@ -29,7 +29,7 @@ included.
 
 Use it to select a supported generation mode, author and validate
 `PipelineConfig` YAML, configure captioning/evaluators, and run the
-`paidf-augmentation:1.2.0` container. It covers Cosmos Transfer/Predict,
+`cdf-augmentation:1.2.0` container. It covers Cosmos Transfer/Predict,
 Cosmos3 WSM controls, image editing, image-to-video, BYOM endpoints, and
 quality gates.
 
@@ -142,8 +142,8 @@ Execute this gate before every other step:
       the revision, verify the tag first, then compare its resolved full commit.
    d. Build the image and capture its immutable `sha256:` image ID, or obtain a
       verified registry digest.
-   e. Create the `paidf` Docker bridge if needed and attach local services.
-   f. Launch the container using the recorded image ID, the `paidf` network,
+   e. Create the `cdf` Docker bridge if needed and attach local services.
+   f. Launch the container using the recorded image ID, the `cdf` network,
       required volume mounts, `--entrypoint /bin/bash`, and only the endpoint
       key variables named by `api_key_env` plus the scoped storage credential
       variables required for the configured remote media.
@@ -225,39 +225,39 @@ test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse "${EXPECTED_RELEASE_REF}^{commit}")"
 
 DOCKER_BUILDKIT=0 docker build \
-  -t paidf-augmentation:1.2.0 \
+  -t cdf-augmentation:1.2.0 \
   -f docker/Dockerfile .
-PAIDF_IMAGE_ID="$(docker image inspect --format '{{.Id}}' paidf-augmentation:1.2.0)"
-case "$PAIDF_IMAGE_ID" in sha256:*) ;; *) exit 1 ;; esac
-test "$(docker image inspect --format '{{.Id}}' paidf-augmentation:1.2.0)" = "$PAIDF_IMAGE_ID"
+CDF_IMAGE_ID="$(docker image inspect --format '{{.Id}}' cdf-augmentation:1.2.0)"
+case "$CDF_IMAGE_ID" in sha256:*) ;; *) exit 1 ;; esac
+test "$(docker image inspect --format '{{.Id}}' cdf-augmentation:1.2.0)" = "$CDF_IMAGE_ID"
 
-docker network inspect paidf >/dev/null 2>&1 || \
-  docker network create paidf
+docker network inspect cdf >/dev/null 2>&1 || \
+  docker network create cdf
 # Attach each local model container once, for example:
-# docker network connect paidf vlm
+# docker network connect cdf vlm
 
 # Example only: replace these with exactly the api_key_env names declared by
 # the selected config; use an empty array when every endpoint is unauthenticated.
-PAIDF_ENDPOINT_KEY_ARGS=()
+CDF_ENDPOINT_KEY_ARGS=()
 # Authenticated example:
-# PAIDF_ENDPOINT_KEY_ARGS=(-e VLM_API_KEY -e LLM_API_KEY -e VEO_API_KEY)
+# CDF_ENDPOINT_KEY_ARGS=(-e VLM_API_KEY -e LLM_API_KEY -e VEO_API_KEY)
 
 # Forward only credential names required by the configured remote media. Give
 # checker containers their own scoped credentials in their deployment.
-PAIDF_STORAGE_CREDENTIAL_ARGS=()
+CDF_STORAGE_CREDENTIAL_ARGS=()
 # S3-compatible example (include only the names your storage config requires):
-# PAIDF_STORAGE_CREDENTIAL_ARGS=(-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+# CDF_STORAGE_CREDENTIAL_ARGS=(-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
 #   -e AWS_DEFAULT_REGION -e AWS_ENDPOINT_URL)
 
 docker run -it --rm \
-  --network paidf \
-  "${PAIDF_ENDPOINT_KEY_ARGS[@]}" \
-  "${PAIDF_STORAGE_CREDENTIAL_ARGS[@]}" \
+  --network cdf \
+  "${CDF_ENDPOINT_KEY_ARGS[@]}" \
+  "${CDF_STORAGE_CREDENTIAL_ARGS[@]}" \
   -v "$(pwd)/modules:/workspace/modules" \
   -v "$(pwd)/configs:/workspace/configs" \
   -v "$(pwd)/data:/workspace/data" \
   --entrypoint /bin/bash \
-  "$PAIDF_IMAGE_ID"
+  "$CDF_IMAGE_ID"
 ```
 
 Persist the captured `sha256:` ID and use it directly for every later launch;
@@ -265,7 +265,7 @@ never re-resolve the mutable tag as the launch target. For registry releases,
 verify the signed manifest and use `name:tag@sha256:<manifest-digest>`.
 
 - **Networking:** augmentation is an outbound-only client and does not publish
-  ports. Use the user-defined `paidf` bridge for the augmentation container and
+  ports. Use the user-defined `cdf` bridge for the augmentation container and
   every local model, Arbitrator, and checker container. `cosmos-evaluator` may
   be a container/DNS hostname on that bridge; it is not a second bridge name.
   Change endpoint URLs from host `localhost` addresses to container DNS names,
@@ -278,7 +278,7 @@ verify the signed manifest and use `name:tag@sha256:<manifest-digest>`.
 
 > **Warning:** Never enable Docker host-network mode on shared, multi-tenant, or
 > production hosts. It is permitted only when all three conditions hold: (1) a
-> required host-local service cannot be moved onto the `paidf` bridge, (2) the
+> required host-local service cannot be moved onto the `cdf` bridge, (2) the
 > host is single-tenant and isolated with no other workloads, and (3) the user
 > sends an explicit message in the current conversation choosing host networking
 > after receiving a warning that it removes network namespace isolation. Silence,

@@ -16,7 +16,6 @@ endpoints:
     role: llm
     url: "http://localhost:8002/v1"          # local vLLM container, no auth
     model: "Qwen/Qwen2.5-14B-Instruct"
-  # Cosmos3 generator NIM (nvstaging/nim/cosmos3) deployed on GPU5.
   # This NIM speaks the Visual-GenAI REST contract POST /v1/infer (Cosmos3Request),
   # NOT the OpenAI /v1/videos/sync route — so use the `nim` adapter, not
   # `openai.video.sync`. The Cosmos3Request schema FORBIDS extra fields, so this

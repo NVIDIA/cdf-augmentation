@@ -2,7 +2,7 @@
 
 > Configs live under `configs/cookbook/<use-case>/`. See the [cookbook index](../../../configs/cookbook/README.md) for the folder layout.
 
-Run inference and schema validation **inside the `paidf-augmentation:1.2.0` Docker container** (see SKILL.md → *Before You Start, Step 2*) for a consistent environment. All inference is remote (no local model weights), so most failures are config-resolution or endpoint/auth issues, not missing local dependencies.
+Run inference and schema validation **inside the `cdf-augmentation:1.2.0` Docker container** (see SKILL.md → *Before You Start, Step 2*) for a consistent environment. All inference is remote (no local model weights), so most failures are config-resolution or endpoint/auth issues, not missing local dependencies.
 
 ## Config Validation Errors
 

@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 managed = true
+# CVE-2026-63374 / CVE-2026-64847: anyio (via httpx, openai) must be >= 4.14.2.
+# GHSA-vxq7-64xx-v4gw / GHSA-8988-9cw3-xx77: urllib3 (via requests, botocore) must be >= 2.8.0.
+constraint-dependencies = ["anyio>=4.14.2", "urllib3>=2.8.0"]
 
 [project]
-name = "paidf-augmentation"
-version = "1.1.0"
-description = "Physical AI Data Factory (PAIDF) Augmentation: a pipeline for processing camera data through generative AI models (Cosmos Transfer, Cosmos Predict, image-edit, and more)"
+name = "cdf-augmentation"
+version = "1.2.0"
+description = "Cosmos Data Factory (CDF) Augmentation: a pipeline for processing camera data through generative AI models (Cosmos Transfer, Cosmos Predict, image-edit, and more)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

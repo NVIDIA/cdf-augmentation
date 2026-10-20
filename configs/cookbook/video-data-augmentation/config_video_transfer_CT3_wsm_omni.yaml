@@ -1,0 +1,78 @@
+# Focused Cosmos3-Super WSM transfer reference for SQA.
+#
+# The augmentation client reads both local inputs and uploads them to vllm-omni:
+#   rgb -> input_reference
+#   controls.wsm -> control_reference, with control_type=wsm
+# The server supplies the uploaded control_path for this request, so do not put a
+# control_path or control field under extra_params.wsm.
+data:
+  - inputs:
+      rgb: "/workspace/data/sample_input.mp4"
+      controls:
+        wsm: "/workspace/data/sample_wsm.mp4"
+    output:
+      prefix: "output_wsm"
+      video: "s3://<BUCKET>/${data.0.output.prefix}/ct3_omni_wsm.mp4"
+      caption: "s3://<BUCKET>/${data.0.output.prefix}/ct3_omni_wsm.txt"
+      metadata: "s3://<BUCKET>/${data.0.output.prefix}/ct3_omni_wsm_metadata.json"
+
+endpoints:
+  # The async adapter expects the URL to be the create route. It creates the job
+  # at POST /v1/videos, polls /v1/videos/{id}, then downloads {id}/content.
+  - id: cosmos3-transfer-wsm
+    role: video_transfer
+    url: "http://cosmos3-transfer:8001/v1/videos"
+    model: "nvidia/Cosmos3-Super"
+    adapter: openai.video.async
+    timeout: 7200
+
+pipeline:
+  retry: 0
+  regenerate_caption_on_retry: false
+  logging:
+    enabled: true
+    level: "INFO"
+
+# A fixed prompt keeps this SQA case focused on WSM upload and generation; no
+# separate VLM, LLM, or evaluator services are required.
+captioning:
+  llm:
+    text: >-
+      Generate a realistic scene that follows the supplied world-state control
+      while preserving the subjects, camera viewpoint, geometry, and motion.
+
+augmentation:
+  model:
+    # BYOM selector: this intentionally matches endpoints[].id above. Model
+    # names are free-form after the endpoint-registry migration; the wire model
+    # remains endpoints[].model (nvidia/Cosmos3-Super).
+    name: "cosmos3-transfer-wsm"
+    version: "super-transfer"
+
+  parameters:
+    # Keep num_frames, max_frames, and num_video_frames_per_chunk equal. Adjust
+    # all three together for the SQA input/control pair. Cosmos frame counts use
+    # the 4n+1 form; this reference follows the 121-frame vllm-omni example.
+    size: "1280x720"
+    num_frames: 121
+    fps: 10
+    num_inference_steps: 50
+    guidance_scale: 5.0
+    flow_shift: 10.0
+    seed: 2026
+
+    extra_params:
+      # With one active control, its weight normalizes to 1.0. Use
+      # control_guidance below to tune the absolute control strength.
+      wsm:
+        control_weight: 1.0
+      resolution: "720"
+      control_guidance: 1.2
+      guardrails: false
+      use_resolution_template: false
+      use_duration_template: false
+      num_conditional_frames: 1
+      num_first_chunk_conditional_frames: 0
+      share_vision_temporal_positions: true
+      num_video_frames_per_chunk: 121
+      max_frames: 121

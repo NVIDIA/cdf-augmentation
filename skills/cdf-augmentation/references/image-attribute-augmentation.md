@@ -9,7 +9,7 @@ This is an image-to-image workflow. Use the `image-edit` model path only; do not
 - Do not modify repo code unless the user explicitly asks. Runtime config copies, logs, and outputs can live under `/tmp` or the requested Image Attribute Augmentation dataset/output directory.
 - Never write model keys to config files, logs, or scripts. Pass user-provided keys through environment variables named by each endpoint's `api_key_env` — e.g. `VLM_API_KEY`, `LLM_API_KEY`, `BUILD_NVIDIA_API_KEY`.
 - **All inference is remote (BYOM).** The endpoint-only image bundles no local model weights. Image-edit endpoints are entries in the config's `endpoints:` list (role `image_edit`); choose the API contract with the endpoint's `adapter` field (`nim`, `openai.chat.completions`, or `openai.images.edits`). Captioning/verification use the `vlm` and `llm` role endpoints.
-- **Safe Docker defaults.** Run the container as your own user (`--user "$(id -u):$(id -g)"`) and on the shared `paidf` bridge so outputs are not world-writable and host ports are not exposed. Run local model servers in containers on that bridge and use their container names in endpoint URLs. Never grant the augmentation container host-network access or make host directories world-writable on shared or multi-user machines.
+- **Safe Docker defaults.** Run the container as your own user (`--user "$(id -u):$(id -g)"`) and on the shared `cdf` bridge so outputs are not world-writable and host ports are not exposed. Run local model servers in containers on that bridge and use their container names in endpoint URLs. Never grant the augmentation container host-network access or make host directories world-writable on shared or multi-user machines.
 - Keep checked-in Image Attribute Augmentation distribution configs as templates. Make runtime copies with concrete `data_dir`, `config_output`, `output_root`, and template paths.
 - Validate generated configs and inspect expected `output.jpg` and `output_metadata.json` files. The CLI can exit successfully even when a specific sample did not produce an image.
 - For remote OpenAI-compatible model endpoints, the augmentation container does not need GPU flags. A GPU is only required for the `data_processing.alignment` post-processor (cupy/CUDA).
@@ -19,7 +19,7 @@ This is an image-to-image workflow. Use the `image-edit` model path only; do not
 Build the endpoint-only augmentation image from the repo root when the user asks for a fresh local image (use legacy BuildKit per the repo's build convention):
 
 ```bash
-DOCKER_BUILDKIT=0 docker build -t paidf-augmentation:1.2.0 -f docker/Dockerfile .
+DOCKER_BUILDKIT=0 docker build -t cdf-augmentation:1.2.0 -f docker/Dockerfile .
 ```
 
 Launch the container from the repo root with the dataset and output mounted to stable `/workspace/data` paths:
@@ -28,12 +28,12 @@ Launch the container from the repo root with the dataset and output mounted to s
 HOST_DATA="/absolute/path/to/dataset_root"
 HOST_OUT="/absolute/path/to/augmented_out"
 mkdir -p "$HOST_OUT"
-docker network inspect paidf >/dev/null 2>&1 || \
-  docker network create paidf
+docker network inspect cdf >/dev/null 2>&1 || \
+  docker network create cdf
 
 docker run -it --rm \
   --user "$(id -u):$(id -g)" \
-  --network paidf \
+  --network cdf \
   -e VLM_API_KEY \
   -e LLM_API_KEY \
   -e BUILD_NVIDIA_API_KEY \
@@ -43,10 +43,10 @@ docker run -it --rm \
   -v "$HOST_OUT:/workspace/data/out" \
   -w /workspace \
   --entrypoint /bin/bash \
-  paidf-augmentation:1.2.0
+  cdf-augmentation:1.2.0
 ```
 
-> **Security & fallbacks.** Running as your own UID (`--user`) lets the container write `$HOST_OUT` without world-writable permissions, and the `:ro` mounts give read-only access to `modules/`/`configs/`, so no `chmod` is needed for them. The launch above uses the isolated `paidf` bridge. Attach local model containers to that bridge and address them by container name; host-network access is prohibited. If a non-default UID cannot use the image's prebuilt environment, drop `--user` and instead make `$HOST_OUT` writable by the container's non-root uid 10000 (e.g. `chown`), reserving world-writable permissions as a last resort on isolated single-user machines only. Prefer a secrets manager that injects the required environment variables; otherwise export only the required keys and forward their names with `-e VAR_NAME`. Never mount or load broad `.env`, SSH, cloud-credential, or token files.
+> **Security & fallbacks.** Running as your own UID (`--user`) lets the container write `$HOST_OUT` without world-writable permissions, and the `:ro` mounts give read-only access to `modules/`/`configs/`, so no `chmod` is needed for them. The launch above uses the isolated `cdf` bridge. Attach local model containers to that bridge and address them by container name; host-network access is prohibited. If a non-default UID cannot use the image's prebuilt environment, drop `--user` and instead make `$HOST_OUT` writable by the container's non-root uid 10000 (e.g. `chown`), reserving world-writable permissions as a last resort on isolated single-user machines only. Prefer a secrets manager that injects the required environment variables; otherwise export only the required keys and forward their names with `-e VAR_NAME`. Never mount or load broad `.env`, SSH, cloud-credential, or token files.
 
 Inside the container, all deterministic commands below assume `/workspace` as the working directory.
 
@@ -115,7 +115,7 @@ Validate configs with `PipelineConfig` before launching a batch when the change 
 
 ## Running Image Edit
 
-Run image-edit augmentation inside `paidf-augmentation:1.2.0` (the endpoint-only image bundles the repo deps and reaches the model over a remote endpoint — no local weights). Run each generated config with `uv run modules/cli.py --config <cfg>` and log stdout/stderr per config. Do not pass API keys on the command line; export only the required keys and forward their names with Docker `-e VAR_NAME`.
+Run image-edit augmentation inside `cdf-augmentation:1.2.0` (the endpoint-only image bundles the repo deps and reaches the model over a remote endpoint — no local weights). Run each generated config with `uv run modules/cli.py --config <cfg>` and log stdout/stderr per config. Do not pass API keys on the command line; export only the required keys and forward their names with Docker `-e VAR_NAME`.
 
 Docker and UV notes:
 

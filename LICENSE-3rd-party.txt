@@ -1,9 +1,9 @@
 # Dependencies Licenses
 
 This file contains the license texts for all third-party components redistributed
-in the paidf-augmentation container image.
+in the cdf-augmentation container image.
 
-Generated from the contents of the built image (version 1.1.0), not from the
+Generated from the contents of the built image (version 1.2.0), not from the
 lockfile: license texts are taken from the dist-info actually installed in
 /workspace/.venv, and the native components are read from the upstream sources
 preserved under /usr/share/oss-sources/ in the image.
@@ -111,7 +111,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 
-## anyio (4.12.1)
+## anyio (4.14.2)
 
 **License:** MIT
 
@@ -9378,7 +9378,7 @@ Apache License
 
 --------------------------------------------------------------------------------
 
-## urllib3 (2.7.0)
+## urllib3 (2.8.0)
 
 **License:** MIT
 
@@ -10256,13 +10256,13 @@ OTHER DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
 
-## python (CPython) (3.13.15)
+## python (CPython) (3.13.16)
 
 **License:** PSF-2.0
 
-**License URL:** https://github.com/python/cpython/blob/v3.13.15/LICENSE
+**License URL:** https://github.com/python/cpython/blob/v3.13.16/LICENSE
 
-**Note:** uv-managed interpreter installed under /opt/uv/python. Source tarball preserved at /usr/share/oss-sources/Python-3.13.15.tar.xz.
+**Note:** uv-managed interpreter installed under /opt/uv/python. Source tarball preserved at /usr/share/oss-sources/Python-3.13.16.tar.xz.
 
 ```
 A. HISTORY OF THE SOFTWARE
@@ -10546,13 +10546,13 @@ PERFORMANCE OF THIS SOFTWARE.
 
 --------------------------------------------------------------------------------
 
-## uv (0.12.5)
+## uv (0.12.24)
 
 **License:** Apache-2.0 OR MIT
 
 **License URL:** https://github.com/astral-sh/uv?tab=Apache-2.0-1-ov-file
 
-**Note:** Binary copied from ghcr.io/astral-sh/uv:0.12.5; used as the image entrypoint runner. Source tarball preserved at /usr/share/oss-sources/uv-0.12.5.tar.gz.
+**Note:** Binary copied from ghcr.io/astral-sh/uv:0.12.24; used as the image entrypoint runner. Source tarball preserved at /usr/share/oss-sources/uv-0.12.24.tar.gz.
 
 ```
 ===== LICENSE-APACHE =====

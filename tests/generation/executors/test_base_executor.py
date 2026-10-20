@@ -22,9 +22,9 @@ IMAGE_EDIT_SPEC = {
 class FakeAdapter(BaseAdapter):
     """Records the payload it was handed and returns a canned Result."""
 
-    def __init__(self, result=None):
+    def __init__(self, result=None, role="image_edit"):
         # Bypass BaseAdapter.__init__ wiring (no real endpoint needed here).
-        self.endpoint = SimpleNamespace(id="fake", role="image_edit")
+        self.endpoint = SimpleNamespace(id="fake", role=role)
         self.logger = LOGGER
         self.result = result if result is not None else Result(media_bytes=b"out")
         self.last_payload = None
@@ -63,7 +63,7 @@ class TestExecute:
         assert (tmp_path / "out.png").read_bytes() == b"generated"
 
     def test_text_result_writes_text(self, tmp_path):
-        adapter = FakeAdapter(Result(text="hi"))
+        adapter = FakeAdapter(Result(text="hi"), role="llm")
         ex = _make_executor(
             adapter=adapter, inputs_spec={"prompt": {"required": True, "kind": "text"}}
         )
@@ -73,6 +73,50 @@ class TestExecute:
 
         assert ok is True
         assert (tmp_path / "out.txt").read_text() == "hi"
+
+    @pytest.mark.parametrize(
+        "role", ["image_edit", "image2video", "video_transfer", "video_predict"]
+    )
+    def test_text_result_for_media_role_fails(self, tmp_path, role):
+        # vllm-omni's reply when the diffusion engine yields no output: HTTP 200
+        # with this string as content. It must fail generation, not be written
+        # to the media path as a "successful" output.
+        adapter = FakeAdapter(
+            Result(text="Image generation completed but no images were produced."),
+            role=role,
+        )
+        ex = _make_executor(adapter=adapter)
+        rgb = _write_input(tmp_path)
+        out = str(tmp_path / "out.png")
+
+        ok, path = ex.execute("edit", rgb, {}, out)
+
+        assert ok is False
+        assert path is None
+        assert not (tmp_path / "out.png").exists()
+
+    def test_text_result_for_media_role_error_names_server_text(self, tmp_path):
+        adapter = FakeAdapter(Result(text="no images were produced", request_id="r9"))
+        ex = _make_executor(adapter=adapter)
+        rgb = _write_input(tmp_path)
+
+        with pytest.raises(ValueError, match="image_edit endpoint returned text") as e:
+            ex.run({"prompt": "edit", "rgb": rgb}, str(tmp_path / "out.png"))
+
+        assert "r9" in str(e.value)
+        assert "no images were produced" in str(e.value)
+
+    def test_empty_media_bytes_fails(self, tmp_path):
+        adapter = FakeAdapter(Result(media_bytes=b""))
+        ex = _make_executor(adapter=adapter)
+        rgb = _write_input(tmp_path)
+        out = str(tmp_path / "out.png")
+
+        ok, path = ex.execute("edit", rgb, {}, out)
+
+        assert ok is False
+        assert path is None
+        assert not (tmp_path / "out.png").exists()
 
     def test_missing_required_input_is_swallowed(self, tmp_path):
         ex = _make_executor()

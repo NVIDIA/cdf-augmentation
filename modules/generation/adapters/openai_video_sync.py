@@ -14,7 +14,9 @@ differs from the JSON ``/v1/infer`` NIM in **both** directions:
   * **Request** is ``multipart/form-data``, not JSON. The first-frame image is a
     *file* part (``input_reference``); every generation knob is a *form field*
     (``prompt``, ``size``, ``num_frames``, ...); and nested structures
-    (``extra_params``) are sent as a **JSON string** form field.
+    (``extra_params``) are sent as a **JSON string** form field. Cosmos3 WSM
+    transfer adds a second file part (``control_reference``) and the form field
+    ``control_type=wsm``.
   * **Response** is the **raw MP4 bytes** (``Accept: video/mp4``), not a JSON
     envelope with base64.
 
@@ -30,7 +32,9 @@ Reference::
 
     POST {url}/v1/videos/sync          (multipart/form-data, Accept: video/mp4)
       file: input_reference=<first frame image>
+      file: control_reference=<optional WSM control video>
       form: prompt, negative_prompt, size, num_frames, fps,
+            control_type='wsm',
             num_inference_steps, guidance_scale, flow_shift,
             extra_params='{"guardrails": true, ...}'   # JSON string
       -> raw MP4 bytes
@@ -63,6 +67,8 @@ VIDEO_DEFAULT_TIMEOUT = 900.0
 # them, without a code change.
 DEFAULT_ROUTE = "/v1/videos/sync"
 DEFAULT_FILE_FIELD = "input_reference"
+DEFAULT_CONTROL_FILE_FIELD = "control_reference"
+DEFAULT_CONTROL_TYPE_FIELD = "control_type"
 DEFAULT_ACCEPT = "video/mp4"
 
 
@@ -98,16 +104,19 @@ class OpenAIVideoSyncAdapter(BaseAdapter):
 
     def invoke(self, payload: Dict[str, Any]) -> Result:
         params = dict(payload.get("params") or {})
-        # Cosmos3 / vllm-omni transfer references a *precomputed* control by PATH
-        # inside ``extra_params`` (the server reads it) rather than uploading the
-        # control bytes. Fold each control input into
+        controls = dict(control_media(payload))
+        wsm = controls.pop("wsm", None)
+
+        # Preserve the existing path-based behavior for control types other than
+        # WSM. WSM uses vllm-omni's request-scoped multipart upload below, so the
+        # client and generation server do not need a shared filesystem.
+        # Fold each remaining control input into
         # ``extra_params.<modality> = {"control_path": <path>}``, without
         # overriding a modality the config already set (e.g. ``edge: true`` to
-        # auto-compute). edge/blur can auto-compute; depth/seg/wsm need a path.
-        controls = control_media(payload)
+        # auto-compute).
         if controls:
             extra = dict(params.get("extra_params") or {})
-            for name, item in controls:
+            for name, item in controls.items():
                 if name not in extra and item.get("path"):
                     extra[name] = {"control_path": item["path"]}
             params["extra_params"] = extra
@@ -129,15 +138,23 @@ class OpenAIVideoSyncAdapter(BaseAdapter):
         if self.model:
             data.setdefault("model", self.model)
 
-        # Upload only the primary input (rgb); controls ride in extra_params above.
+        # Upload the primary input (rgb) and, when present, the pre-rendered WSM
+        # control. vllm-omni persists the control for this request and injects its
+        # temporary path into extra_params.wsm on the server side.
+        files = {}
         media = primary_media(payload)
         if media is not None:
             filename = _basename(media.get("path")) or "input.png"
             mime = media.get("mime", "image/png")
-            post_kwargs = {
-                "data": data,
-                "files": {self.file_field: (filename, media["bytes"], mime)},
-            }
+            files[self.file_field] = (filename, media["bytes"], mime)
+        if wsm is not None:
+            filename = _basename(wsm.get("path")) or "wsm.mp4"
+            mime = wsm.get("mime", "video/mp4")
+            files[DEFAULT_CONTROL_FILE_FIELD] = (filename, wsm["bytes"], mime)
+            data[DEFAULT_CONTROL_TYPE_FIELD] = "wsm"
+
+        if files:
+            post_kwargs = {"data": data, "files": files}
         else:
             # Text-to-video: no file part. Force multipart anyway (``data=`` alone
             # is application/x-www-form-urlencoded, which the /v1/videos/sync
@@ -190,8 +207,8 @@ class OpenAIVideoSyncAdapter(BaseAdapter):
         if not request_id:
             raise ValueError("NVCF returned HTTP 202 without an NVCF-REQID")
 
-        status_url = _nvcf_status_base_url().rstrip("/") + "/" + quote(
-            str(request_id), safe=""
+        status_url = (
+            _nvcf_status_base_url().rstrip("/") + "/" + quote(str(request_id), safe="")
         )
         self.logger.info("NVCF request accepted request_id=%s; polling", request_id)
         while True:
@@ -205,9 +222,7 @@ class OpenAIVideoSyncAdapter(BaseAdapter):
             poll_headers["NVCF-POLL-SECONDS"] = str(
                 min(self.nvcf_poll_seconds, max(1, int(remaining) - 1))
             )
-            response = requests.get(
-                status_url, headers=poll_headers, timeout=remaining
-            )
+            response = requests.get(status_url, headers=poll_headers, timeout=remaining)
             if response.status_code != 202:
                 self.logger.info(
                     "NVCF request finished request_id=%s status=%s",
